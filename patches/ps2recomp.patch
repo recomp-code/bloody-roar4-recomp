@@ -34648,7 +34648,7 @@ index 37b6a4dec..2b1914aeb 100644
      static constexpr uint32_t D_STAT = 0x1000E010u;
      static constexpr uint32_t D_CTRL = 0x1000E000u;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d267..7e83d497e 100644
+index 45cb9d267..45e533263 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,9 +1,15 @@
@@ -34690,7 +34690,7 @@ index 45cb9d267..7e83d497e 100644
  
  namespace ps2_stubs
  {
-@@ -37,6 +52,113 @@ namespace ps2_stubs
+@@ -37,6 +52,168 @@ namespace ps2_stubs
  #define EM_MIPS 8            // MIPS architecture
  #define PT_LOAD 1            // Loadable segment
  
@@ -34708,6 +34708,54 @@ index 45cb9d267..7e83d497e 100644
 +        AudioStream stream{};
 +        bool ready = false;
 +        std::vector<int16_t> buffer;
++        // PS2X_WAVCAP=<file.wav>: also record what goes to the device (16-bit stereo 48 kHz), e.g. to mux with
++        // a screen recording. <file>.start holds the wall clock (Unix ms) of the first recorded sample.
++        FILE *wav = nullptr;
++        uint64_t wavBytes = 0;
++
++        static void writeWavHeader(FILE *f, uint64_t dataBytes)
++        {
++            const uint32_t data = static_cast<uint32_t>(std::min<uint64_t>(dataBytes, 0xFFFFFFF0ull));
++            const uint32_t riff = data + 36u, fmtSize = 16u, rate = 48000u, byteRate = rate * 4u;
++            const uint16_t pcm = 1u, channels = 2u, align = 4u, bits = 16u;
++            std::fseek(f, 0, SEEK_SET);
++            std::fwrite("RIFF", 1, 4, f); std::fwrite(&riff, 4, 1, f); std::fwrite("WAVEfmt ", 1, 8, f);
++            std::fwrite(&fmtSize, 4, 1, f); std::fwrite(&pcm, 2, 1, f); std::fwrite(&channels, 2, 1, f);
++            std::fwrite(&rate, 4, 1, f); std::fwrite(&byteRate, 4, 1, f); std::fwrite(&align, 2, 1, f);
++            std::fwrite(&bits, 2, 1, f); std::fwrite("data", 1, 4, f); std::fwrite(&data, 4, 1, f);
++            std::fseek(f, 0, SEEK_END);
++        }
++
++        void capture(const int16_t *samples, size_t frames)
++        {
++            static const char *s_path = std::getenv("PS2X_WAVCAP");
++            if (!s_path || !s_path[0])
++                return;
++            if (!wav)
++            {
++                wav = std::fopen(s_path, "wb");
++                if (!wav)
++                {
++                    s_path = nullptr;
++                    return;
++                }
++                writeWavHeader(wav, 0);
++                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                    std::chrono::system_clock::now().time_since_epoch()).count();
++                if (FILE *start = std::fopen((std::string(s_path) + ".start").c_str(), "w"))
++                {
++                    std::fprintf(start, "%lld\n", static_cast<long long>(ms));
++                    std::fclose(start);
++                }
++            }
++            std::fwrite(samples, sizeof(int16_t), frames * 2u, wav);
++            wavBytes += frames * 4u;
++            if (wavBytes % (48000u * 4u) < frames * 4u) // about once a second
++            {
++                writeWavHeader(wav, wavBytes);
++                std::fflush(wav);
++            }
++        }
 +
 +        void start()
 +        {
@@ -34751,12 +34799,19 @@ index 45cb9d267..7e83d497e 100644
 +            {
 +                const size_t got = ps2x::iop::readAudioFrames(buffer.data(), kFrames);
 +                std::fill(buffer.begin() + static_cast<std::ptrdiff_t>(got * 2u), buffer.end(), int16_t{0});
++                capture(buffer.data(), kFrames);
 +                UpdateAudioStream(stream, buffer.data(), static_cast<int>(kFrames));
 +            }
 +        }
 +
 +        void stop()
 +        {
++            if (wav)
++            {
++                writeWavHeader(wav, wavBytes);
++                std::fclose(wav);
++                wav = nullptr;
++            }
 +            if (!ready)
 +                return;
 +            StopAudioStream(stream);
@@ -34804,7 +34859,7 @@ index 45cb9d267..7e83d497e 100644
  static constexpr int FB_WIDTH = 640;
  static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-@@ -151,8 +273,18 @@ namespace
+@@ -151,8 +328,18 @@ namespace
          return true;
      }
  
@@ -34823,7 +34878,7 @@ index 45cb9d267..7e83d497e 100644
          DispatchHistory &h = g_dispatchHistory;
          h.pcs[h.next] = pc;
          h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
-@@ -162,6 +294,27 @@ namespace
+@@ -162,6 +349,27 @@ namespace
          }
      }
  
@@ -34851,7 +34906,7 @@ index 45cb9d267..7e83d497e 100644
      std::string formatDispatchHistory()
      {
          const DispatchHistory &h = g_dispatchHistory;
-@@ -477,10 +630,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -477,10 +685,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_hasUploadedFrame = true;
  }
  
@@ -34888,7 +34943,7 @@ index 45cb9d267..7e83d497e 100644
  
      m_eeScheduler = std::make_unique<EeScheduler>(*this);
  
-@@ -526,6 +705,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -526,6 +760,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
  
  PS2Runtime::~PS2Runtime()
  {
@@ -34896,7 +34951,7 @@ index 45cb9d267..7e83d497e 100644
      try
      {
          requestStop();
-@@ -605,9 +785,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+@@ -605,9 +840,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
      m_iopSubsystem->onSifTransfer(transfer);
  }
  
@@ -34915,7 +34970,7 @@ index 45cb9d267..7e83d497e 100644
  }
  
  void PS2Runtime::resetIop()
-@@ -715,6 +904,21 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -715,6 +959,21 @@ bool PS2Runtime::syncCoreSubsystems()
  
  bool PS2Runtime::initialize(const char *title)
  {
@@ -34937,7 +34992,7 @@ index 45cb9d267..7e83d497e 100644
      try
      {
          if (!m_memory.initialize())
-@@ -731,7 +935,10 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,7 +990,10 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -34949,7 +35004,7 @@ index 45cb9d267..7e83d497e 100644
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
-@@ -1064,6 +1271,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+@@ -1064,6 +1326,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
          paths.cdRoot = paths.elfDirectory;
          paths.mcRoot = paths.elfDirectory / "mc0";
      }
@@ -34961,7 +35016,7 @@ index 45cb9d267..7e83d497e 100644
  
      setIoPaths(paths);
  }
-@@ -1342,6 +1554,393 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+@@ -1342,6 +1609,393 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
      }
  }
  
@@ -35355,7 +35410,7 @@ index 45cb9d267..7e83d497e 100644
  bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                       R5900Context *ctx,
                                       uint32_t targetPc,
-@@ -1352,6 +1951,88 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1352,6 +2006,88 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  {
      ctx->pc = targetPc;
      const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -35444,7 +35499,7 @@ index 45cb9d267..7e83d497e 100644
  
      // Every inter-function transfer is also a deterministic EE safe point.
      // Backward edges inside generated functions use eeCheckpointDue(), while
-@@ -1363,7 +2044,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1363,7 +2099,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      if (!isCall)
      {
@@ -35453,7 +35508,7 @@ index 45cb9d267..7e83d497e 100644
          {
              reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
          }
-@@ -1372,6 +2053,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1372,6 +2108,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -35468,7 +35523,7 @@ index 45cb9d267..7e83d497e 100644
      if (!hasFunction(targetPc))
      {
          reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
-@@ -1396,6 +2085,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +2140,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -35484,7 +35539,7 @@ index 45cb9d267..7e83d497e 100644
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,11 +2101,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,11 +2156,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -35511,7 +35566,7 @@ index 45cb9d267..7e83d497e 100644
      return ctx->pc == fallthroughPc;
  }
  
-@@ -1489,6 +2201,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+@@ -1489,6 +2256,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
      {
          ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
      }
@@ -35529,7 +35584,7 @@ index 45cb9d267..7e83d497e 100644
  }
  
  void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
-@@ -2339,6 +3062,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+@@ -2339,6 +3117,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
      raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
  }
  
@@ -35657,7 +35712,7 @@ index 45cb9d267..7e83d497e 100644
  void PS2Runtime::run()
  {
      m_stopRequested.store(false, std::memory_order_relaxed);
-@@ -2367,6 +3211,7 @@ void PS2Runtime::run()
+@@ -2367,6 +3266,7 @@ void PS2Runtime::run()
      std::thread gameThread([&]()
                             {
          ThreadNaming::SetCurrentThreadName("GameThread");
@@ -35665,7 +35720,7 @@ index 45cb9d267..7e83d497e 100644
          try
          {
              m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
-@@ -2385,6 +3230,9 @@ void PS2Runtime::run()
+@@ -2385,6 +3285,9 @@ void PS2Runtime::run()
          }
          gameThreadFinished.store(true, std::memory_order_release); });
  
@@ -35675,7 +35730,7 @@ index 45cb9d267..7e83d497e 100644
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
-@@ -2392,6 +3240,8 @@ void PS2Runtime::run()
+@@ -2392,6 +3295,8 @@ void PS2Runtime::run()
              tick++;
              if ((tick % 120) == 0)
              {
@@ -35684,7 +35739,7 @@ index 45cb9d267..7e83d497e 100644
                  uint64_t curDma = m_memory.dmaStartCount();
                  uint64_t curGif = m_memory.gifCopyCount();
                  uint64_t curGs = m_memory.gsWriteCount();
-@@ -2418,10 +3268,104 @@ void PS2Runtime::run()
+@@ -2418,10 +3323,104 @@ void PS2Runtime::run()
                                                 << " vif=" << curVif
                                                 << std::endl);
  
@@ -35789,7 +35844,7 @@ index 45cb9d267..7e83d497e 100644
          UploadFrame(frameTex, this, presentWidth, presentHeight);
  
          BeginDrawing();
-@@ -2459,6 +3403,7 @@ void PS2Runtime::run()
+@@ -2459,6 +3458,7 @@ void PS2Runtime::run()
      {
          gameThread.join();
      }

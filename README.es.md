@@ -20,6 +20,18 @@ en tu GPU con el render de [PCSX2](https://github.com/PCSX2/pcsx2), igual que lo
 
 *Capturas del port nativo (RTX 4090): 16:9, resolución interna 6x; la última con DLSS 5 a 1920x1080.*
 
+### Video: una pelea con DLSS 5
+
+<!-- inline-video -->
+[▶ Resumen, 30 s (720p60)](docs/videos/br4_dlss5_highlights.mp4)
+
+*Busuzima contra Uriko con todo lo de calidad activado: "DLSS 5" (Direct3D 12, NVIDIA DLSS con el pase neural de
+RenoDX encima), 16:9, 60 fps y el sonido del juego. GitHub solo reproduce dentro de la página videos de hasta 10 MB.*
+**[▶ Video completo, 2:30 a 2488x1400 60 fps (AV1): pantalla de título, selección de personaje y la pelea entera](docs/videos/br4_dlss5_full.mp4)**
+
+Grabado en el port nativo con `tools\record_video_dlss5.ps1` (la ventana tal como se ve, así que el pase neural
+sale en el video, más el audio del runtime con `PS2X_WAVCAP`).
+
 ## Estado
 
 Jugable: arranque, memory card (AUTO LOAD), los videos HUDSONCI y OPENING, título, selección de

@@ -21,6 +21,18 @@ controller support. The game is recompiled to native x64 code with
 
 *Captured on the native build (RTX 4090): 16:9, 6x internal resolution; the last one with DLSS 5 at 1920x1080.*
 
+### Video: a fight with DLSS 5
+
+<!-- inline-video -->
+[▶ Highlights, 30 s (720p60)](docs/videos/br4_dlss5_highlights.mp4)
+
+*Busuzima vs. Uriko with every quality option on: "DLSS 5" (Direct3D 12, NVIDIA DLSS with the RenoDX
+neural pass on top), 16:9, 60 fps, with the game's own sound. GitHub only plays videos up to 10 MB inline.*
+**[▶ Full video, 2:30 at 2488x1400 60 fps (AV1): title screen, character select and the whole fight](docs/videos/br4_dlss5_full.mp4)**
+
+Recorded on the native build with `tools\record_video_dlss5.ps1` (the window as it is shown, so the neural pass is
+in it, plus the runtime's audio through `PS2X_WAVCAP`).
+
 ## Status
 
 Playable: boot, memory card (AUTO LOAD), the HUDSONCI and OPENING videos, title, character select and

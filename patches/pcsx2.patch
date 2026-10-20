@@ -6376,7 +6376,7 @@ index 5f6f8d409..dcb6638b8 100644
  public:
  	GSRenderer();
 diff --git a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
-index 8541f266a..b317f5f47 100644
+index 8541f266a..5e6cf5106 100644
 --- a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
 +++ b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
 @@ -27,6 +27,12 @@
@@ -6536,7 +6536,7 @@ index 8541f266a..b317f5f47 100644
  bool GSDevice12::CompileImGuiPipeline()
  {
  	const std::optional<std::string> hlsl = ReadShaderSource("shaders/dx11/imgui.fx");
-@@ -2511,6 +2640,259 @@ bool GSDevice12::DoCAS(
+@@ -2511,6 +2640,261 @@ bool GSDevice12::DoCAS(
  	return true;
  }
  
@@ -6680,12 +6680,14 @@ index 8541f266a..b317f5f47 100644
 +	// Temporal DLSS with motion vectors estimated from the frames, as on Vulkan
 +	// (PS2X_DLSS_MOTION=0 turns it off); history dropped on 3D <-> flat screen switches.
 +	static const bool s_motion = [] { const char* e = std::getenv("PS2X_DLSS_MOTION"); return !e || e[0] != '0'; }();
++	// Flat screens (no game depth: menus, text, videos) frame by frame, as on Vulkan (PS2X_DLSS_FLAT_MOTION=1 = vectors there too).
++	static const bool s_flat_motion = [] { const char* e = std::getenv("PS2X_DLSS_FLAT_MOTION"); return e && e[0] == '1'; }();
 +	static int s_prev_real_depth = -1;
 +	const bool scene_change = s_prev_real_depth != static_cast<int>(real_depth);
 +	s_prev_real_depth = static_cast<int>(real_depth);
 +	if (mv->GetState() == GSTexture::State::Cleared)
 +		mv->CommitClear(cmdlist);
-+	const bool have_motion = s_motion && EstimateMotion(sTex, src_rect);
++	const bool have_motion = s_motion && (real_depth || s_flat_motion) && EstimateMotion(sTex, src_rect);
 +	if (scene_change)
 +		m_mv_have_prev = s_motion;
 +	static const bool s_use_bias = [] { const char* e = std::getenv("PS2X_DLSS_BIAS"); return !e || std::atof(e) > 0.0; }();
@@ -7137,7 +7139,7 @@ index 6bf6af8eb..28f9cc874 100644
  {
  	NSError* err = nil;
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
-index d3dad7e9c..a042041c2 100644
+index d3dad7e9c..4d628874d 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 +++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 @@ -21,10 +21,21 @@
@@ -7251,7 +7253,7 @@ index d3dad7e9c..a042041c2 100644
  
  	m_swap_chain.reset();
  
-@@ -4774,6 +4839,535 @@ bool GSDeviceVK::DoCAS(
+@@ -4774,6 +4839,538 @@ bool GSDeviceVK::DoCAS(
  	return true;
  }
  
@@ -7655,10 +7657,13 @@ index d3dad7e9c..a042041c2 100644
 +	// off: then the history is dropped every frame). The history is also dropped when the game
 +	// switches between 3D and flat screens (menus, videos, loading), seen as the depth coming/going.
 +	static const bool s_motion = [] { const char* e = std::getenv("PS2X_DLSS_MOTION"); return !e || e[0] != '0'; }();
++	// Flat screens (no game depth: menus, text, videos) are upscaled frame by frame: block matching on text and 2D
++	// fades finds false matches and smears the letters. PS2X_DLSS_FLAT_MOTION=1 keeps the vectors there too.
++	static const bool s_flat_motion = [] { const char* e = std::getenv("PS2X_DLSS_FLAT_MOTION"); return e && e[0] == '1'; }();
 +	static int s_prev_real_depth = -1;
 +	const bool scene_change = s_prev_real_depth != static_cast<int>(real_depth);
 +	s_prev_real_depth = static_cast<int>(real_depth);
-+	const bool have_motion = s_motion && EstimateMotion(cmdbuf, sTex, src_rect);
++	const bool have_motion = s_motion && (real_depth || s_flat_motion) && EstimateMotion(cmdbuf, sTex, src_rect);
 +	if (scene_change)
 +		m_mv_have_prev = s_motion; // keep this frame as the reference, but restart the history
 +

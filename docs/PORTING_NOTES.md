@@ -96,6 +96,8 @@ it off (the launcher's 4:3 option, with the `_4x3` presets).
 - **`sceGifPkAddGsAD` / `sceGifPkCloseGifTag` (HLE):** the DMA tag's qwc is added once, when the tag is closed,
   like the SDK does (it used to be counted twice and the video pictures never reached the GS).
 - **Diagnostics:** `PS2X_IOP_RPC_LOG=n`, `PS2X_PATH3_TRACE=<s>`, `PS2X_GS_DUMP` alongside the live host.
+- **`PS2X_WAVCAP=<file.wav>`:** records what goes to the audio device (16-bit stereo 48 kHz); `<file>.start` holds
+  the wall clock of the first sample, so it can be muxed with a screen recording (`tools\record_video_dlss5.ps1`).
 
 ## 6. GS host
 
@@ -112,6 +114,11 @@ BT4 host patches `pcsx2-gsrunner-live-dbz.patch` and `pcsx2-gsrunner-dbz-windows
   (`dxgi.dll`), the RenoDX DLSS 5 add-on and NVIDIA's `nvngx_dlssnr.dll` (DLSS Neural Rendering) taken from DLSS 5
   Swapper. A separate copy of the host so the normal one never loads ReShade. F6 = neural pass on/off, Home =
   ReShade / add-on menu. DLSS (and so the neural pass) only runs when the window is larger than the 2x image.
+- **DLSS on flat screens:** temporal DLSS uses motion vectors estimated on the GPU (block matching), the game's
+  depth buffer and a "bias current colour" mask. On screens without game depth (menus, text, logos, videos) the
+  block matching finds false matches in text and 2D fades and smeared the letters (worse with the DLSS 5 neural
+  pass on top), so there the host now upscales frame by frame (no vectors, no history); 3D scenes keep temporal
+  DLSS. `PS2X_DLSS_FLAT_MOTION=1` restores vectors on flat screens; `PS2X_DLSS_MOTION=0` turns them off everywhere.
 
 ## 7. Measurements (RTX 4090)
 
