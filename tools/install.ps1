@@ -1,0 +1,297 @@
+<#
+  Full installer for the Bloody Roar 4 [Analog Stick Mod] PC port, run by the launcher's "Prepare game" button.
+  From your ISO to a playable game:
+    1. Visual Studio 2022 Build Tools (C++ compiler), if missing  [asks for administrator rights]
+    2. CMake and Git: the installed ones, or portable copies in <Root>\tools
+    3. Your ISO: checks it is the Analog Stick Mod build of SLES-51877 and copies its files to <Root>\game\iso
+    4. PS2Recomp sources (pinned commit) with this repository's patch
+    5. Recompiler -> the game's C++ code (generated on YOUR PC from YOUR ELF) -> game executable
+    6. Renderer (PCSX2's pcsx2-gsrunner): a gshost-win64*.zip next to the launcher (release zip), a ready host folder
+       (-GsHostDir), a download (-GsHostUrl) or a build from source (-BuildPcsx2); plus NVIDIA's DLSS runtime
+  The recompiler configuration (function list, stubs, entry points) comes from this repository (game\config), so
+  Ghidra is not needed. Every step is skipped when already done, so it can simply be run again after an error.
+  Manual use:  powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Iso "D:\Games\Bloody Roar 4 Analog.iso"
+#>
+param(
+    [string]$Iso = "",
+    [string]$Root = $(if ($env:BR4_ROOT) { $env:BR4_ROOT } else { 'C:\BloodyRoar4Recomp' }),
+    [string]$GsHostDir = "",          # a folder with a ready pcsx2-gsrunner.exe built from patches\pcsx2.patch
+    [string[]]$GsHostUrl = @(),       # prebuilt renderer zip(s) to download (when not shipped next to the launcher)
+    [switch]$BuildPcsx2,              # build the renderer from source instead
+    [switch]$Rebuild,                 # regenerate and rebuild the game even if it exists
+    [switch]$RecompilerOnly           # stop after the recompiler, no ISO needed (troubleshooting)
+)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$Repo = Split-Path -Parent $PSScriptRoot
+$Tools = Join-Path $Root 'tools'
+$Logs = Join-Path $Root 'logs'
+New-Item -ItemType Directory -Force $Root, $Tools, $Logs, "$Tools\dl", "$Root\game\iso" | Out-Null
+
+# The ELF this port's function list was made from: Bloody Roar 4 PAL (SLES-51877) with the Analog Stick Mod.
+$ElfName = 'SLES_518.77'
+$ElfSha256 = '228548DAB8E4EFD03316C643F39210498691C24C9C39D65DF7715A74BF83DCDB'
+
+# Portable copies, used only when CMake / Git are not already installed (see step 2).
+$CMakeDir = "$Tools\cmake\cmake-4.4.4-windows-x86_64\bin"
+$GitDir = "$Tools\mingit\cmd"
+$MinCMake = [version]'3.21'   # PS2Recomp's cmake_minimum_required
+$Downloads = @{
+    VsBuildTools = 'https://aka.ms/vs/17/release/vs_BuildTools.exe'
+    CMake        = 'https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip'
+    MinGit       = 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/MinGit-2.56.0.2-64-bit.zip'
+}
+$DlssDllUrl = 'https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/rel/nvngx_dlss.dll'
+if (-not $GsHostUrl -and (Test-Path "$Repo\gshost\release_url.txt")) { $GsHostUrl = @(Get-Content "$Repo\gshost\release_url.txt" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+
+$Host.UI.RawUI.WindowTitle = 'Bloody Roar 4 - preparing the game'
+function Step($text) { Write-Host ""; Write-Host "==> $text" -ForegroundColor Cyan }
+function Download($url, $file) {
+    if (Test-Path $file) { return }
+    Write-Host "    downloading $url"
+    Invoke-WebRequest -Uri $url -OutFile "$file.part" -UseBasicParsing
+    Move-Item "$file.part" $file -Force
+}
+function Run($exe, [string[]]$arguments, $log, [scriptblock]$OnLine = $null) {
+    Write-Host "    $([IO.Path]::GetFileName($exe)) $($arguments -join ' ')"
+    # Native tools print warnings on stderr (CMake's deprecation notices, for one). With
+    # $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns every redirected stderr line
+    # into a terminating error, so a configure that only warned stopped the install. Run them with
+    # 'Continue' and judge them by their exit code alone.
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($log) {
+            & $exe @arguments 2>&1 | ForEach-Object { $line = "$_"; if ($OnLine) { & $OnLine $line }; $line } | Out-File -FilePath $log -Encoding utf8
+        } else {
+            & $exe @arguments
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+    if ($code) { throw "$([IO.Path]::GetFileName($exe)) failed with code $code$(if ($log) { " (see $log)" })" }
+}
+
+# A tool already installed and on PATH (with a minimum version), or $null.
+function Find-OnPath($name, [version]$minVersion) {
+    $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $cmd) { return $null }
+    if ($minVersion) {
+        $saved = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $text = (& $cmd.Source --version 2>&1 | Select-Object -First 1) -as [string] } finally { $ErrorActionPreference = $saved }
+        if ($text -notmatch '(\d+\.\d+(\.\d+)?)' -or [version]$Matches[1] -lt $minVersion) { return $null }
+    }
+    return Split-Path -Parent $cmd.Source
+}
+
+try {
+# ---------------------------------------------------------------- 1. C++ compiler
+Step "C++ compiler (Visual Studio 2022 Build Tools)"
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+function Find-VS { if (Test-Path $vswhere) { & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } }
+if (-not (Find-VS)) {
+    Download $Downloads.VsBuildTools "$Tools\dl\vs_BuildTools.exe"
+    Write-Host "    installing (about 5 GB; Windows will ask for administrator permission)..."
+    $p = Start-Process "$Tools\dl\vs_BuildTools.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+        '--passive', '--wait', '--norestart',
+        '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+        '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+        '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
+        '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project')
+    if ($p.ExitCode -notin 0, 3010) { throw "The Build Tools installation failed ($($p.ExitCode))" }
+    if (-not (Find-VS)) { throw "Build Tools not found after installing them" }
+}
+Write-Host "    OK: $(Find-VS)"
+
+# ---------------------------------------------------------------- 2. portable tools
+Step "CMake and Git"
+# Portable copies in <Root>\tools (or the NBA Street V3 port's, same versions), the installed ones, or a download.
+. "$PSScriptRoot\env.ps1" -Root $Root
+if (-not (Test-Path "$CMakeDir\cmake.exe")) {
+    if ($BR4CMake) { $CMakeDir = $BR4CMake }
+    elseif ($found = Find-OnPath 'cmake' $MinCMake) { $CMakeDir = $found }
+    else {
+        Download $Downloads.CMake "$Tools\dl\cmake.zip"
+        Expand-Archive "$Tools\dl\cmake.zip" "$Tools\cmake" -Force
+    }
+}
+if (-not (Test-Path "$GitDir\git.exe")) {
+    if ($BR4Git) { $GitDir = $BR4Git }
+    elseif ($found = Find-OnPath 'git') { $GitDir = $found }
+    else {
+        Download $Downloads.MinGit "$Tools\dl\mingit.zip"
+        Expand-Archive "$Tools\dl\mingit.zip" "$Tools\mingit" -Force
+    }
+}
+$env:Path = "$GitDir;$CMakeDir;$env:Path"
+Write-Host "    CMake: $CMakeDir"
+Write-Host "    Git:   $GitDir"
+
+# ---------------------------------------------------------------- 3. the game (your ISO)
+Step "Your copy of the game"
+$isoTarget = Join-Path $Root 'game\BloodyRoar4.iso'
+$elf = Join-Path $Root "game\iso\$ElfName"
+if ($RecompilerOnly) {
+    Write-Host "    skipped (-RecompilerOnly)"
+} else {
+if (-not (Test-Path $elf)) {
+    if (-not $Iso) { throw "Choose your ISO in the launcher first" }
+    if (-not (Test-Path $Iso)) { throw "File not found: $Iso" }
+    # Read straight from the image (no mounting): first the ELF, to check it is the right game and version.
+    $check = Join-Path $Tools 'dl\elfcheck'
+    if (Test-Path $check) { Remove-Item $check -Recurse -Force }
+    try { & "$PSScriptRoot\iso_extract.ps1" -Iso $Iso -Out $check -Only $ElfName | Out-Null }
+    catch { throw "This ISO is not Bloody Roar 4 PAL (SLES-51877): $($_.Exception.Message)" }
+    $hash = (Get-FileHash (Join-Path $check $ElfName) -Algorithm SHA256).Hash
+    Remove-Item $check -Recurse -Force
+    if ($hash -ne $ElfSha256) {
+        throw "This is Bloody Roar 4 PAL, but not the [Analog Stick Mod] build this port was made for (its $ElfName has SHA-256 $hash). The port needs the Analog Stick Mod ISO."
+    }
+    Write-Host "    copying the disc files (about 1.3 GB)..."
+    & "$PSScriptRoot\iso_extract.ps1" -Iso $Iso -Out "$Root\game\iso" | ForEach-Object { Write-Host "    $_" }
+}
+# The game also reads disc sectors directly: the image itself next to the extracted files.
+if (-not (Test-Path $isoTarget)) {
+    if (-not $Iso) { throw "Choose your ISO in the launcher first" }
+    $src = (Resolve-Path $Iso).Path
+    if ([IO.Path]::GetPathRoot($src) -eq [IO.Path]::GetPathRoot($isoTarget)) {
+        New-Item -ItemType HardLink -Path $isoTarget -Target $src | Out-Null   # same drive: no copy needed
+    } else {
+        Copy-Item $src $isoTarget
+    }
+}
+Write-Host "    OK: $elf"
+}
+
+# ---------------------------------------------------------------- 4. sources
+Step "PS2Recomp sources (with the patch)"
+& "$PSScriptRoot\setup_sources.ps1" -Root $Root -WithPcsx2:$BuildPcsx2
+
+# ---------------------------------------------------------------- 5. recompiler and game
+$build = Join-Path $Root 'PS2Recomp\out\build'
+$recompExe = Join-Path $build 'ps2xRecomp\Release\ps2_recomp.exe'
+$gameExe = Join-Path $build 'ps2xRuntime\Release\ps2EntryRunner.exe'
+$configure = @('-S', "$Root\PS2Recomp", '-B', $build, '-G', 'Visual Studio 17 2022', '-A', 'x64',
+    '-DPS2X_BUILD_STUDIO=OFF', '-DPS2X_BUILD_TEST=OFF', '-DPS2X_BUILD_ANALYZER=OFF',
+    '-DPS2X_ENABLE_RUNNER_UNITY_BUILD=ON', '-DPS2X_ENABLE_RUNNER_PCH=ON', '-DPS2X_SHOW_WINDOWS_CONSOLE=OFF')
+Step "Recompiler"
+if (-not (Test-Path $recompExe)) {
+    Run "$CMakeDir\cmake.exe" $configure "$Logs\install_configure.log"
+    Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2_recomp', '--parallel') "$Logs\install_recomp.log"
+}
+Write-Host "    OK"
+if ($RecompilerOnly) {
+    Write-Host ""
+    Write-Host "==> Recompiler ready (-RecompilerOnly)." -ForegroundColor Green
+    return
+}
+
+Step "Game code (generated from your ELF)"
+$runner = Join-Path $Root 'PS2Recomp\ps2xRuntime\src\runner'
+if ($Rebuild -or -not (Test-Path "$runner\bloody_roar4_overrides.cpp")) {
+    & "$PSScriptRoot\generate_game.ps1" -Root $Root
+}
+Write-Host "    OK"
+
+Step "Compiling the game (the first time this can take more than an hour)"
+if ($Rebuild -or -not (Test-Path $gameExe)) {
+    Run "$CMakeDir\cmake.exe" $configure "$Logs\install_configure2.log"
+    # Some blocks of the game code need several GB each to compile: one compiler per ~2.5 GB of RAM
+    # (never more than the cores), or Windows pages to disk and the build takes many hours.
+    $ramGB = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+    $jobs = [int][math]::Max(2, [math]::Min([Environment]::ProcessorCount, [math]::Floor($ramGB / 2.5)))
+    # Progress: MSBuild prints each block of game code ("unity_N_cxx.cxx") as it compiles it.
+    $unityDir = Join-Path $build 'ps2xRuntime\CMakeFiles\ps2EntryRunner.dir\Unity'
+    $script:blocksTotal = [math]::Max(1, @(Get-ChildItem $unityDir -Filter 'unity_*_cxx.cxx' -ErrorAction SilentlyContinue).Count)
+    $script:blocksDone = 0
+    $script:buildStart = Get-Date
+    Write-Host "    $jobs compilers at once, $($script:blocksTotal) blocks of game code"
+    $progress = {
+        param($line)
+        if ($line -notmatch '^\s+unity_\d+_cxx\.cxx\s*$') { return }
+        $script:blocksDone++
+        if ($script:blocksDone % 10 -ne 0 -and $script:blocksDone -ne $script:blocksTotal) { return }
+        $pct = [math]::Min(100, [int](100 * $script:blocksDone / $script:blocksTotal))
+        $elapsed = ((Get-Date) - $script:buildStart).TotalMinutes
+        # The last blocks hold the biggest functions and are the slowest: pad the estimate.
+        $left = [math]::Ceiling($elapsed / $script:blocksDone * ($script:blocksTotal - $script:blocksDone) * 1.5)
+        Write-Host -NoNewline ("`r    compiling: {0}/{1} blocks ({2}%), about {3} min left      " -f $script:blocksDone, $script:blocksTotal, $pct, $left)
+    }
+    Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2EntryRunner', '--', '/m:1', "/p:CL_MPCount=$jobs") "$Logs\install_game.log" $progress
+    Write-Host ''
+}
+Write-Host "    OK: $gameExe"
+
+# ---------------------------------------------------------------- 6. renderer
+Step "Renderer (PCSX2 pcsx2-gsrunner)"
+$gshost = Join-Path $Root 'gshost'
+$DbzHost = 'C:\DBZBT4Recomp\gshost'
+# Prebuilt renderer: shipped next to the launcher in the release zip, otherwise a host folder, a download or a build.
+$localZips = @(Get-ChildItem $Repo -Filter 'gshost-win64*.zip' -ErrorAction SilentlyContinue)
+# A newer release zip (e.g. after unzipping an update over the old one) refreshes the renderer.
+$rendererOutdated = (Test-Path "$gshost\pcsx2-gsrunner.exe") -and $localZips.Count -and
+    ($localZips | Where-Object { $_.LastWriteTime -gt (Get-Item "$gshost\pcsx2-gsrunner.exe").LastWriteTime })
+if ($rendererOutdated) { Write-Host "    updating the renderer from the new release" }
+if ($rendererOutdated -or $GsHostDir -or -not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
+    if ($GsHostDir) {
+        & "$PSScriptRoot\setup_gshost.ps1" -Root $Root -From $GsHostDir
+    } elseif (-not $BuildPcsx2 -and $localZips.Count) {
+        New-Item -ItemType Directory -Force $gshost | Out-Null
+        foreach ($z in $localZips) { Expand-Archive $z.FullName $gshost -Force }
+    } elseif (-not $BuildPcsx2 -and -not $GsHostUrl -and (Test-Path "$DbzHost\pcsx2-gsrunner.exe")) {
+        # The DBZ Budokai Tenkaichi 4 port's host is this same pcsx2-gsrunner build (patches\pcsx2.patch).
+        Write-Host "    using the GS host of the DBZ BT4 port ($DbzHost)"
+        & "$PSScriptRoot\setup_gshost.ps1" -Root $Root -From $DbzHost
+    } elseif ($BuildPcsx2 -or -not $GsHostUrl) {
+        if (-not $BuildPcsx2) { Write-Warning "No prebuilt renderer found: building it from source (needs LLVM, Ninja, Python, PortableGit and 7-Zip in $Tools, see docs\BUILDING.md)" }
+        if (-not $BuildPcsx2) { & "$PSScriptRoot\setup_sources.ps1" -Root $Root -WithPcsx2 }
+        if (-not (Test-Path "$Root\pcsx2\deps\bin") -and -not (Test-Path 'C:\NBAStreetRecomp\pcsx2\deps\bin')) {
+            Run "$PSScriptRoot\build_pcsx2_deps.bat" @() "$Logs\install_pcsx2_deps.log"
+        }
+        Run "$PSScriptRoot\build_pcsx2.cmd" @('pcsx2-gsrunner') "$Logs\install_pcsx2.log"
+        & "$PSScriptRoot\setup_gshost.ps1" -Root $Root
+    } else {
+        New-Item -ItemType Directory -Force $gshost | Out-Null
+        foreach ($url in @($GsHostUrl)) {
+            $file = Join-Path "$Tools\dl" ([IO.Path]::GetFileName($url))
+            Download $url $file
+            Expand-Archive $file $gshost -Force
+        }
+    }
+}
+# Portable mode and the graphics presets (only when missing: F1 in the game saves the player's changes into them).
+if (-not (Test-Path "$gshost\portable.ini")) { New-Item -ItemType File "$gshost\portable.ini" | Out-Null }
+foreach ($ini in Get-ChildItem "$Repo\gshost" -Filter 'br4*.ini') {
+    if (-not (Test-Path (Join-Path $gshost $ini.Name))) { Copy-Item $ini.FullName $gshost }
+}
+# NVIDIA DLSS runtime, straight from NVIDIA's official SDK repository (only used on RTX GPUs; the
+# renderer falls back to AMD FSR without it). nvngx_dlss.orig.dll keeps it for the launcher's
+# "use my own DLSS DLLs" switch.
+if (-not (Test-Path "$gshost\nvngx_dlss.dll")) {
+    try {
+        Download $DlssDllUrl "$Tools\dl\nvngx_dlss.dll"
+        Copy-Item "$Tools\dl\nvngx_dlss.dll" "$gshost\nvngx_dlss.dll"
+    } catch {
+        Write-Warning "NVIDIA DLSS runtime not downloaded ($($_.Exception.Message)); the upscaler will use AMD FSR."
+    }
+}
+if ((Test-Path "$gshost\nvngx_dlss.dll") -and -not (Test-Path "$gshost\nvngx_dlss.orig.dll")) {
+    Copy-Item "$gshost\nvngx_dlss.dll" "$gshost\nvngx_dlss.orig.dll"
+}
+Write-Host "    OK: $gshost"
+
+# ---------------------------------------------------------------- done
+# Play.cmd in the project folder too (starts the game with the launcher's saved settings).
+Set-Content (Join-Path $Root 'Play.cmd') @('@echo off', "call `"$Repo\Play.cmd`" %*") -Encoding ascii
+Write-Host ""
+Write-Host "==> Done! You can close this window and press PLAY in the launcher." -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    Write-Host "==> Something went wrong: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "    Press 'Prepare game' again to retry (finished steps are skipped)."
+    Write-Host "    If it keeps failing, open an issue on GitHub and attach the files in $Logs."
+    if ($RecompilerOnly) { exit 1 }
+}

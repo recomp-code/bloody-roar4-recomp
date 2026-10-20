@@ -1,0 +1,42 @@
+# Never upload anything from the game: ISO, ELF, extracted disc files, generated code, saves, textures.
+*.iso
+*.ISO
+*.bin
+*.img
+*.IMG
+SLES_*
+SLUS_*
+SCES_*
+SYSTEM.CNF
+*.IRX
+*.irx
+game/iso/
+game/output/
+game/ghidra_project/
+mc0/
+mc1/
+ps2xRuntime/
+register_functions.cpp
+ps2_recompiled_*.h
+ps2_recompiled_*.cpp
+*.gs
+*.png
+# (except the README screenshots, which are our own captures)
+!docs/screenshots/*.png
+# Builds, binaries and logs (no exe/dll: GS host, NVIDIA DLSS, ReShade or add-ons are never committed)
+out/
+build/
+logs/
+release/
+*.log
+*.pdb
+*.exe
+*.dll
+*.addon64
+*.zip
+# Local tool folders and settings written by the game or the launcher
+tools/dl/
+DLSS/
+gshost_dlss5/
+reshade-cache/
+ReShadePreset.ini
