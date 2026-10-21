@@ -29872,7 +29872,7 @@ index b1bb6d851..dd9848304 100644
      }
  
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index 44eaef4d9..2c06e8ee6 100644
+index 44eaef4d9..a5c6420ce 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 @@ -483,6 +483,21 @@ namespace ps2_stubs
@@ -29992,7 +29992,7 @@ index 44eaef4d9..2c06e8ee6 100644
                              playback,
                              buffer.data() + payloadStart,
                              packetEnd - payloadStart,
-@@ -1394,6 +1454,52 @@ namespace ps2_stubs
+@@ -1394,6 +1454,35 @@ namespace ps2_stubs
              }
          }
  
@@ -30004,32 +30004,15 @@ index 44eaef4d9..2c06e8ee6 100644
 +            uint64_t demuxBytes = 0u;
 +            uint64_t pictures = 0u;
 +            uint64_t pictureWaits = 0u;
-+            uint32_t lastRingBase = 0u;
-+            uint32_t lastRingSize = 0u;
 +        } g_mpegActivity;
 +
-+        void reportMpegActivityUnlocked(const uint8_t *rdram, uint32_t mpegAddr, const MpegPlaybackState &playback)
++        void reportMpegActivityUnlocked(uint32_t mpegAddr, const MpegPlaybackState &playback)
 +        {
 +            static auto s_last = std::chrono::steady_clock::now();
 +            const auto now = std::chrono::steady_clock::now();
 +            if (now - s_last < std::chrono::seconds(2))
 +                return;
 +            s_last = now;
-+            // The game's ring descriptor follows its data (Bloody Roar 4: write offset, count, size).
-+            uint32_t ringWords[3] = {};
-+            if (rdram && g_mpegActivity.lastRingBase != 0u && g_mpegActivity.lastRingSize != 0u)
-+            {
-+                for (uint32_t i = 0; i < 3u; ++i)
-+                    if (const uint8_t *p = getConstMemPtr(rdram, g_mpegActivity.lastRingBase + g_mpegActivity.lastRingSize + i * 4u))
-+                        std::memcpy(&ringWords[i], p, 4u);
-+            }
-+            uint32_t playerState = 0u; // Bloody Roar 4's movie loop state word (0x30981C; 1+ = CD error recovery)
-+            if (rdram)
-+                if (const uint8_t *p = getConstMemPtr(rdram, 0x30981Cu))
-+                    std::memcpy(&playerState, p, 4u);
-+            std::cerr << "[MPEG:ring] base=0x" << std::hex << g_mpegActivity.lastRingBase << " wr=0x" << ringWords[0]
-+                      << " count=0x" << ringWords[1] << " size=0x" << ringWords[2] << " state=0x" << playerState << std::dec
-+                      << std::endl;
 +            std::cerr << "[MPEG:status] mpeg=0x" << std::hex << mpegAddr << std::dec
 +                      << " demux=" << g_mpegActivity.demuxCalls << "/" << g_mpegActivity.demuxBackpressured
 +                      << " bytes=" << g_mpegActivity.demuxBytes
@@ -30045,25 +30028,19 @@ index 44eaef4d9..2c06e8ee6 100644
          bool mpegDemuxBackpressured(const MpegPlaybackState &playback)
          {
              // Let EOF finalization drain any tail that is already in the guest
-@@ -1409,8 +1515,16 @@ namespace ps2_stubs
+@@ -1409,8 +1498,10 @@ namespace ps2_stubs
              // lets the game's producer loop wake the consumer again. Backpressure
              // still propagates naturally to sceCdStRead because the ring does not
              // advance while this is true.
 +            // Pictures beyond kMaxDecodedPicturesAhead wait compressed (feedOrDeferVideo), so the
 +            // limit here is on those bytes: the audio interleaved in the stream keeps flowing.
-+            // PS2X_MPEG_PENDING_CAP_MB=n overrides the cap (diagnostics).
-+            static const size_t s_cap = []
-+            {
-+                const char *env = std::getenv("PS2X_MPEG_PENDING_CAP_MB");
-+                return env && env[0] ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) << 20u : kMaxPendingVideoBytes;
-+            }();
              return !g_mpeg_stub_state.currentCdStreamEofSeen &&
 -                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
-+                   playback.pendingVideoBytes >= s_cap;
++                   playback.pendingVideoBytes >= kMaxPendingVideoBytes;
          }
  
          void recordCdStreamBytesDemuxedUnlocked(
-@@ -1620,6 +1734,104 @@ namespace ps2_stubs
+@@ -1620,6 +1711,104 @@ namespace ps2_stubs
              runtime->eeScheduler().queueInvocation(std::move(invocation));
          }
  
@@ -30168,7 +30145,7 @@ index 44eaef4d9..2c06e8ee6 100644
          void dispatchStreamCallbacks(uint8_t *rdram,
                                       R5900Context *ctx,
                                       PS2Runtime *runtime,
-@@ -1885,6 +2097,37 @@ namespace ps2_stubs
+@@ -1885,6 +2074,37 @@ namespace ps2_stubs
              std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
              MpegPlaybackState &playback = getPlaybackState(mpegAddr);
              const size_t framesBefore = playback.decodedFrames.size();
@@ -30206,7 +30183,7 @@ index 44eaef4d9..2c06e8ee6 100644
              while (copied < byteCount)
              {
                  const uint32_t curAddr = dataAddr + static_cast<uint32_t>(copied);
-@@ -1898,6 +2141,14 @@ namespace ps2_stubs
+@@ -1898,6 +2118,14 @@ namespace ps2_stubs
                  feedElementaryStream(playback, src, chunk);
                  copied += chunk;
              }
@@ -30221,7 +30198,7 @@ index 44eaef4d9..2c06e8ee6 100644
              wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
          }
  
-@@ -2045,14 +2296,24 @@ namespace ps2_stubs
+@@ -2045,14 +2273,24 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, uVar3 + 0x80, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, uVar3 + 0x94, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, uVar3 + 0x98, 0xFFFFFFFFu);
@@ -30252,27 +30229,25 @@ index 44eaef4d9..2c06e8ee6 100644
  
          uint32_t setDynamicRet = a1_init;
          if (uint8_t *p = getMemPtr(rdram, puVar4 + 8))
-@@ -2191,6 +2452,12 @@ namespace ps2_stubs
+@@ -2191,6 +2429,10 @@ namespace ps2_stubs
                      callbackEvents);
                  recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
              }
 +            ++g_mpegActivity.demuxCalls;
 +            g_mpegActivity.demuxBackpressured += backpressured ? 1u : 0u;
 +            g_mpegActivity.demuxBytes += consumed;
-+            g_mpegActivity.lastRingBase = ringBaseAddr;
-+            g_mpegActivity.lastRingSize = ringSize;
-+            reportMpegActivityUnlocked(rdram, mpegAddr, playback);
++            reportMpegActivityUnlocked(mpegAddr, playback);
              decodedCount = playback.decodedFrames.size();
              traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
          }
-@@ -2292,11 +2559,17 @@ namespace ps2_stubs
+@@ -2292,11 +2534,17 @@ namespace ps2_stubs
          {
              std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
              MpegPlaybackState &playback = getPlaybackState(mpegAddr);
 +            const bool returnWithoutPicture = playback.returnWithoutPicture;
 +            playback.returnWithoutPicture = false;
 +            ++g_mpegActivity.pictures;
-+            reportMpegActivityUnlocked(rdram, mpegAddr, playback);
++            reportMpegActivityUnlocked(mpegAddr, playback);
              if (playback.decodedFrames.empty() &&
 +                !returnWithoutPicture &&
                  !g_mpeg_stub_state.currentCdStreamEofSeen &&
@@ -30283,7 +30258,7 @@ index 44eaef4d9..2c06e8ee6 100644
                  if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                  {
                      PS2_IF_AGRESSIVE_LOGS({
-@@ -2308,6 +2581,7 @@ namespace ps2_stubs
+@@ -2308,6 +2556,7 @@ namespace ps2_stubs
                      ++g_mpeg_stub_state.getPictureWaitTraceCount;
                  }
                  lock.unlock();
@@ -30291,7 +30266,7 @@ index 44eaef4d9..2c06e8ee6 100644
                  runtime->eeScheduler().waitExternal(
                      EeWaitReason::Mpeg,
                      kMpegPictureWaitType,
-@@ -2392,6 +2666,37 @@ namespace ps2_stubs
+@@ -2392,6 +2641,37 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
          mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
          mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
@@ -30329,7 +30304,7 @@ index 44eaef4d9..2c06e8ee6 100644
  
          if (uint8_t *base = getMemPtr(rdram, mpegAddr))
          {
-@@ -2532,7 +2837,9 @@ namespace ps2_stubs
+@@ -2532,7 +2812,9 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, param_1 + 0x08, 0u);
          mpegGuestWrite32(rdram, inner + 0x80, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, inner + 0xAC, 0u);
