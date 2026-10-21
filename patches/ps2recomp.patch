@@ -31663,10 +31663,10 @@ index f0ad5070b..4f31ff126 100644
              {
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 new file mode 100644
-index 000000000..a0c129644
+index 000000000..5500206f5
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-@@ -0,0 +1,1109 @@
+@@ -0,0 +1,1194 @@
 +#include "gs_dump_writer.h"
 +#include "ps2_live_ring.h"
 +
@@ -31777,9 +31777,49 @@ index 000000000..a0c129644
 +            uint8_t *data = nullptr;
 +            uint64_t capacity = 0;
 +            std::wstring suffix = std::to_wstring(GetCurrentProcessId()); // this instance's ring names
++            bool attached = false; // [handover] took over the ring (and window) of the game before
++
++            // [handover] PS2X_LIVE_ATTACH=<suffix>: the ring of a game that left its window to this one. The host is
++            // already there, waiting: only the producer side is redone (the counters go on where they were).
++            bool attach(const char *existing)
++            {
++                suffix = std::filesystem::path(existing).wstring();
++                mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kMappingName, suffix).c_str());
++                if (!mapping)
++                    return false;
++                void *view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
++                if (!view)
++                    return false;
++                header = static_cast<ps2live::RingHeader *>(view);
++                if (header->magic != ps2live::kMagic || !header->handover)
++                    return false;
++                capacity = header->capacity;
++                data = ps2live::ringData(header);
++                dataEvent = OpenEventW(EVENT_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kDataEventName, suffix).c_str());
++                spaceEvent = OpenEventW(EVENT_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kSpaceEventName, suffix).c_str());
++                readbackEvent = OpenEventW(EVENT_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kReadbackEventName, suffix).c_str());
++                if (!dataEvent || !spaceEvent || !readbackEvent)
++                    return false;
++                header->producerAlive = 1u;
++                header->producerFlags = 1u;
++                header->netStatus = 0u;
++                header->producerPid = GetCurrentProcessId();
++                MemoryBarrier();
++                header->handover = 0u; // last: the host adopts this process
++                SetEvent(dataEvent);
++                attached = true;
++                return true;
++            }
 +
 +            bool open()
 +            {
++                if (const char *existing = std::getenv("PS2X_LIVE_ATTACH"); existing && *existing)
++                {
++                    if (attach(existing))
++                        return true;
++                    std::fprintf(stderr, "[gslive] could not take over ring %s, opening a new window\n", existing);
++                    suffix = std::to_wstring(GetCurrentProcessId());
++                }
 +                capacity = ps2live::kDefaultCapacity;
 +                const uint64_t total = ps2live::mappingSize(capacity);
 +                mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
@@ -31796,6 +31836,7 @@ index 000000000..a0c129644
 +                header->version = ps2live::kVersion;
 +                header->producerAlive = 1u;
 +                header->producerFlags = 1u;
++                header->producerPid = GetCurrentProcessId();
 +                data = ps2live::ringData(header);
 +                std::memset(ps2live::ringReadback(header), 0, sizeof(ps2live::RingReadback));
 +                dataEvent = CreateEventW(nullptr, FALSE, FALSE, ps2live::objectName(ps2live::kDataEventName, suffix).c_str());
@@ -31808,6 +31849,8 @@ index 000000000..a0c129644
 +
 +            bool launchHost()
 +            {
++                if (attached)
++                    return true; // [handover] the host is the previous game's
 +                std::wstring exe = L"C:\\NBAStreetRecomp\\gshost\\pcsx2-gsrunner.exe";
 +                if (const char *custom = std::getenv("PS2X_GSHOST"))
 +                    exe = std::filesystem::path(custom).wstring();
@@ -31835,7 +31878,20 @@ index 000000000..a0c129644
 +                }
 +                CloseHandle(pi.hThread);
 +                hostProcess = pi.hProcess;
++                hostPid = pi.dwProcessId;
 +                return true;
++            }
++            DWORD hostPid = 0;
++
++            // [handover] the old game's side: the window is left to the next game (the host waits for it), and this
++            // process ends at once.
++            [[noreturn]] void leaveWindow()
++            {
++                header->handover = 1u;
++                MemoryBarrier();
++                SetEvent(dataEvent);
++                std::fflush(stderr);
++                std::_Exit(0);
 +            }
 +
 +            bool hostGone() const
@@ -32310,7 +32366,21 @@ index 000000000..a0c129644
 +                    if (init.live.open() && init.live.launchHost())
 +                    {
 +                        init.liveActive = true;
-+                        std::fprintf(stderr, "[gslive] GS host started (PCSX2 renderer)\n");
++                        // [handover] the host read the stream's header from the game before: the stream goes on with packets
++                        if (init.live.attached)
++                            init.headerWritten = true;
++                        std::fprintf(stderr, init.live.attached ? "[gslive] took over the previous game's window\n" : "[gslive] GS host started (PCSX2 renderer)\n");
++#if defined(_WIN32)
++                        // [handover] PS2X_LIVE_RING_FILE: the ring's name (and the host's pid), for the launcher
++                        if (const char *ringFile = std::getenv("PS2X_LIVE_RING_FILE"); ringFile && *ringFile)
++                        {
++                            if (std::FILE *f = std::fopen(ringFile, "wb"))
++                            {
++                                std::fprintf(f, "%ls %lu\n", init.live.suffix.c_str(), static_cast<unsigned long>(init.live.hostPid));
++                                std::fclose(f);
++                            }
++                        }
++#endif
 +                    }
 +                    else
 +                    {
@@ -32765,6 +32835,21 @@ index 000000000..a0c129644
 +        w.writeByte(kTypeVSync);
 +        w.writeByte(static_cast<uint8_t>(field & 1));
 +        w.endPacket();
++#if defined(PS2X_GS_LIVE_RING) && defined(_WIN32)
++        // [handover] PS2X_HANDOVER_FILE appears: the launcher starts another game in this window (an online match
++        // accepted while playing). Here, under the writer's lock and right after a VSync, the stream is between packets.
++        static const char *s_handover = [] { const char *v = std::getenv("PS2X_HANDOVER_FILE"); return (v && *v) ? v : nullptr; }();
++        if (s_handover && w.liveActive && w.live.header && (w.frames % 10u) == 0u)
++        {
++            std::error_code ec;
++            if (std::filesystem::exists(s_handover, ec))
++            {
++                std::filesystem::remove(s_handover, ec);
++                std::fprintf(stderr, "[gslive] leaving the window to the next game at frame %u\n", w.frames);
++                w.live.leaveWindow();
++            }
++        }
++#endif
 +        if (w.file && w.frames % 600u == 0u)
 +            std::fflush(w.file);
 +        ++w.frames;
@@ -32864,10 +32949,10 @@ index c289ba0f2..e5ac8dcf1 100644
      }
 diff --git a/ps2xRuntime/src/lib/gs/ps2_live_ring.h b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
 new file mode 100644
-index 000000000..2ccd49267
+index 000000000..68267c902
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,180 @@
 +#pragma once
 +
 +// Shared-memory ring between the PS2Recomp runtime (producer) and the PCSX2-based GS host
@@ -32931,6 +33016,11 @@ index 000000000..2ccd49267
 +        // Online status the host draws as a banner over the game (same field as the shared host's Ps2LiveRing.h):
 +        // 0 none, 2 waiting for the other player, 3 connected, 4 could not connect, 6 the connection was lost.
 +        volatile uint32_t netStatus;
++        // [handover] (same fields as the shared host's): the game can be replaced under the same window. The old game sets
++        // handover = 1 and exits; the new one opens this ring by name (PS2X_LIVE_ATTACH=<suffix>), writes its pid into
++        // producerPid and clears handover; the host keeps its window meanwhile.
++        volatile uint32_t handover;
++        volatile uint32_t producerPid;
 +    };
 +    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
 +
