@@ -27301,10 +27301,10 @@ index ea86a9cb2..31c69722e 100644
      std::vector<PendingTransfer> m_pendingGifTransfers;
      std::vector<PendingTransfer> m_pendingVif0Transfers;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c48d..a5c88c0aa 100644
+index c5e31c48d..db377415c 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1,16 +1,145 @@
+@@ -1,16 +1,146 @@
  #include "runtime/ee_scheduler.h"
 +#include <atomic>
 +// ps2_crash_handler.cpp: pc field of the guest thread being executed, for PS2X_PROFILE's guest pc samples.
@@ -27333,6 +27333,7 @@ index c5e31c48d..a5c88c0aa 100644
 +#include <emscripten.h>
 +#endif
  #include <stdexcept>
++#include "Net/NetPlay.h"
  
  namespace
  {
@@ -27450,7 +27451,7 @@ index c5e31c48d..a5c88c0aa 100644
      constexpr int KE_OK = 0;
      constexpr int KE_ERROR = -1;
      constexpr int KE_ILLEGAL_PRIORITY = -403;
-@@ -87,14 +216,20 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+@@ -87,14 +217,20 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
      m_executorThread = std::this_thread::get_id();
      m_rdram = rdram;
      m_readyQueues = {};
@@ -27472,7 +27473,7 @@ index c5e31c48d..a5c88c0aa 100644
      m_nextSemaphoreId = 1;
      m_nextEventFlagId = 1;
      m_nextAlarmId = 1;
-@@ -112,6 +247,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+@@ -112,6 +248,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
      m_insideInterrupt = false;
      m_pendingEeTimerInterrupts = 0u;
      m_eeCycle = 0u;
@@ -27483,7 +27484,7 @@ index c5e31c48d..a5c88c0aa 100644
      m_sliceEndCycle = kDefaultTimeSliceCycles;
      m_stopRequested.store(false, std::memory_order_release);
      m_checkpointPending.store(false, std::memory_order_release);
-@@ -215,6 +354,7 @@ void EeScheduler::run()
+@@ -215,6 +355,7 @@ void EeScheduler::run()
              }
          }
          R5900Context &context = running->activeContext();
@@ -27491,7 +27492,7 @@ index c5e31c48d..a5c88c0aa 100644
          if (m_debugPublishCountdown == 0u)
          {
              copyMainContextToRuntime();
-@@ -256,17 +396,39 @@ void EeScheduler::run()
+@@ -256,17 +397,39 @@ void EeScheduler::run()
  
          if (!m_pendingInvocations.empty() && running->invocations.empty())
          {
@@ -27538,7 +27539,7 @@ index c5e31c48d..a5c88c0aa 100644
          {
              if (!running->invocations.empty())
              {
-@@ -280,23 +442,84 @@ void EeScheduler::run()
+@@ -280,23 +443,84 @@ void EeScheduler::run()
                                                  context.pc,
                                                  PS2Runtime::GuestBranchKind::DirectJump,
                                                  "EE scheduler");
@@ -27624,7 +27625,7 @@ index c5e31c48d..a5c88c0aa 100644
              m_guestExecuting.store(false, std::memory_order_release);
              m_insideInterrupt = false;
          }
-@@ -334,10 +557,22 @@ void EeScheduler::run()
+@@ -334,10 +558,22 @@ void EeScheduler::run()
  void EeScheduler::requestStop()
  {
      m_stopRequested.store(true, std::memory_order_release);
@@ -27648,7 +27649,7 @@ index c5e31c48d..a5c88c0aa 100644
  void EeScheduler::postEvent(EeEvent event)
  {
      if (event.type == EeEventType::Stop)
-@@ -349,14 +584,111 @@ void EeScheduler::postEvent(EeEvent event)
+@@ -349,14 +585,111 @@ void EeScheduler::postEvent(EeEvent event)
      {
          std::lock_guard lock(m_eventMutex);
          m_events.push_back(event);
@@ -27761,7 +27762,7 @@ index c5e31c48d..a5c88c0aa 100644
  
      if (m_checkpointPending.load(std::memory_order_acquire) ||
          m_stopRequested.load(std::memory_order_acquire))
-@@ -367,7 +699,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -367,7 +700,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
      const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
      if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
      {
@@ -27770,7 +27771,7 @@ index c5e31c48d..a5c88c0aa 100644
          return true;
      }
  
-@@ -376,6 +708,108 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -376,6 +709,108 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return false;
      }
  
@@ -27879,7 +27880,7 @@ index c5e31c48d..a5c88c0aa 100644
      const GuestThread *running = currentThread();
      if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
      {
-@@ -384,19 +818,126 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -384,19 +819,126 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -28008,7 +28009,7 @@ index c5e31c48d..a5c88c0aa 100644
      }
  }
  
-@@ -471,6 +1012,7 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
+@@ -471,6 +1013,7 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
      {
          ownedStack = it->second.stack;
      }
@@ -28016,7 +28017,7 @@ index c5e31c48d..a5c88c0aa 100644
      m_threads.erase(it);
      publishSnapshot();
      return KE_OK;
-@@ -519,6 +1061,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+@@ -519,6 +1062,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
      m_currentThreadId = 0;
      if (deleteThreadRecord && id != kMainThreadId)
      {
@@ -28024,7 +28025,7 @@ index c5e31c48d..a5c88c0aa 100644
          m_threads.erase(id);
      }
      if (ownedStack != 0u)
-@@ -772,6 +1315,32 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+@@ -772,6 +1316,32 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
          }
      }
      (void)interruptSafe;
@@ -28057,7 +28058,7 @@ index c5e31c48d..a5c88c0aa 100644
      publishSnapshot();
      return KE_OK;
  }
-@@ -863,9 +1432,43 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
+@@ -863,9 +1433,43 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
      return id;
  }
  
@@ -28101,7 +28102,7 @@ index c5e31c48d..a5c88c0aa 100644
      EeSemaphore *object = semaphore(id);
      if (!object)
      {
-@@ -910,11 +1513,28 @@ int EeScheduler::pollSemaphore(int id)
+@@ -910,11 +1514,28 @@ int EeScheduler::pollSemaphore(int id)
  void EeScheduler::waitSemaphore(int id)
  {
      assertExecutor();
@@ -28130,7 +28131,7 @@ index c5e31c48d..a5c88c0aa 100644
          setReturnS32(&self->activeContext(), KE_UNKNOWN_SEMID);
          return;
      }
-@@ -923,6 +1543,16 @@ void EeScheduler::waitSemaphore(int id)
+@@ -923,6 +1544,16 @@ void EeScheduler::waitSemaphore(int id)
          --object->count;
          GuestThread *self = currentThread();
          assert(self != nullptr);
@@ -28147,7 +28148,7 @@ index c5e31c48d..a5c88c0aa 100644
          setReturnS32(&self->activeContext(), id);
          publishSnapshot();
          return;
-@@ -1103,7 +1733,19 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1103,7 +1734,19 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      assertExecutor();
      invocation.sequence = ++m_invocationSequence;
      m_pendingInvocations.push_back(std::move(invocation));
@@ -28168,7 +28169,7 @@ index c5e31c48d..a5c88c0aa 100644
  }
  
  [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
-@@ -1256,11 +1898,37 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1256,11 +1899,37 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
  {
      assertExecutor();
      const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
@@ -28207,7 +28208,7 @@ index c5e31c48d..a5c88c0aa 100644
      std::vector<EeIrqHandler> matching;
      for (const auto &[id, handler] : handlers)
      {
-@@ -1392,10 +2060,37 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
+@@ -1392,10 +2061,37 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
      blockCurrent(std::move(wait));
  }
  
@@ -28246,7 +28247,7 @@ index c5e31c48d..a5c88c0aa 100644
  }
  
  const GuestThread *EeScheduler::thread(int id) const
-@@ -1440,6 +2135,15 @@ const GuestThread *EeScheduler::currentThread() const
+@@ -1440,6 +2136,15 @@ const GuestThread *EeScheduler::currentThread() const
  
  int EeScheduler::currentThreadId() const noexcept
  {
@@ -28262,7 +28263,7 @@ index c5e31c48d..a5c88c0aa 100644
      return m_currentThreadId;
  }
  
-@@ -1633,6 +2337,40 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1633,6 +2338,40 @@ void EeScheduler::makeRunning(GuestThread &item)
  {
      assert(m_currentThreadId == 0);
      assert(item.status == EeThreadStatus::Ready);
@@ -28303,7 +28304,7 @@ index c5e31c48d..a5c88c0aa 100644
      item.status = EeThreadStatus::Running;
      m_currentThreadId = item.id;
      renewTimeSlice();
-@@ -1716,7 +2454,7 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
+@@ -1716,7 +2455,7 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
      m_rescheduleRequested = true;
      if (interruptSafe || m_insideInterrupt)
      {
@@ -28312,7 +28313,7 @@ index c5e31c48d..a5c88c0aa 100644
      }
  }
  
-@@ -1743,6 +2481,20 @@ void EeScheduler::applyPendingPreemption()
+@@ -1743,6 +2482,20 @@ void EeScheduler::applyPendingPreemption()
  void EeScheduler::processPendingEvents()
  {
      assertExecutor();
@@ -28333,7 +28334,7 @@ index c5e31c48d..a5c88c0aa 100644
      processDueDeadlines();
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
-@@ -1800,6 +2552,12 @@ void EeScheduler::processDueDeadlines()
+@@ -1800,6 +2553,12 @@ void EeScheduler::processDueDeadlines()
  
              if (now < pacingDeadline)
              {
@@ -28346,7 +28347,7 @@ index c5e31c48d..a5c88c0aa 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
                                                m_stopRequested.load(std::memory_order_acquire); });
-@@ -1810,11 +2568,14 @@ void EeScheduler::processDueDeadlines()
+@@ -1810,11 +2569,14 @@ void EeScheduler::processDueDeadlines()
                  }
              }
  
@@ -28363,7 +28364,7 @@ index c5e31c48d..a5c88c0aa 100644
              due.insert(due.end(),
                         std::make_move_iterator(m_deadlines.begin()),
                         std::make_move_iterator(firstFuture));
-@@ -1847,11 +2608,17 @@ void EeScheduler::processDueDeadlines()
+@@ -1847,11 +2609,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -28383,11 +28384,14 @@ index c5e31c48d..a5c88c0aa 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -1868,7 +2635,11 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1868,7 +2636,14 @@ void EeScheduler::processEvent(const EeEvent &event)
          break;
      case EeEventType::VBlankStart:
          ++m_vsyncTick;
 +        detHashVsync(m_runtime.memory().getRDRAM(), m_vsyncTick, m_eeCycle);
++        // [netplay] online: this frame's pads (sends ours, waits for the other player's). Before the vblank interrupt,
++        // so the game's vblank handlers already read the frame's inputs.
++        ps2_net::onVsync(m_vsyncTick, m_runtime.memory().getRDRAM(), &m_runtime);
 +        ps2_gsdump::vsync(m_runtime.memory().gs(), static_cast<int>(m_vsyncTick & 1u));
          m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
 +        // GS CSR.VSINT latches at every vblank start until the CPU writes 1 to clear it.
@@ -28395,7 +28399,7 @@ index c5e31c48d..a5c88c0aa 100644
          if ((m_vsyncTick & 1u) != 0u)
          {
              m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
-@@ -1931,6 +2702,34 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1931,6 +2706,34 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -28430,7 +28434,7 @@ index c5e31c48d..a5c88c0aa 100644
      }
  }
  
-@@ -2029,16 +2828,25 @@ void EeScheduler::waitForEvent()
+@@ -2029,16 +2832,25 @@ void EeScheduler::waitForEvent()
      if (hasTimerDeadline)
      {
          const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
@@ -28457,7 +28461,7 @@ index c5e31c48d..a5c88c0aa 100644
      if (!signaled)
      {
          const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
-@@ -2050,7 +2858,7 @@ void EeScheduler::waitForEvent()
+@@ -2050,7 +2862,7 @@ void EeScheduler::waitForEvent()
              accountCycles(step);
              remaining -= step;
          }
@@ -28466,7 +28470,7 @@ index c5e31c48d..a5c88c0aa 100644
      }
  }
  
-@@ -2068,11 +2876,26 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
+@@ -2068,11 +2880,26 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
  
  void EeScheduler::updateNextDeadline()
  {
@@ -28493,7 +28497,7 @@ index c5e31c48d..a5c88c0aa 100644
      const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
                                       [](const ScheduledEvent &left, const ScheduledEvent &right)
                                       {
-@@ -2100,6 +2923,9 @@ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
+@@ -2100,6 +2927,9 @@ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
  
  void EeScheduler::renewTimeSlice()
  {
@@ -28503,6 +28507,692 @@ index c5e31c48d..a5c88c0aa 100644
      m_sliceEndCycle = m_eeCycle + kDefaultTimeSliceCycles;
      m_timeSliceExpired = false;
  }
+diff --git a/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp
+new file mode 100644
+index 000000000..96627ad7c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp
+@@ -0,0 +1,642 @@
++// [netplay] Online play for two players by input lockstep.
++//
++// MODEL: the two games never exchange game state, only the pads. With PS2X_DETERMINISTIC=1 a game is a function of its
++// pad inputs (and PS2X_RTC, and its memory card), so two machines that feed the same inputs on the same frames run the
++// same game. Both boot on their own and meet at the first vblank: from there each frame is numbered by the vblank
++// count, which is the same on both.
++//
++// TIMING: the input sampled at vblank F is applied at vblank F + delay, which gives the network delay * 16.7 ms to
++// carry it. A game that does not have the other player's input for the frame waits for it (lockstep). Each packet
++// repeats the last kRedundancy inputs, so a lost datagram heals with the next one: UDP, no retransmits.
++//
++// CHECK: every PS2X_NET_CHECKEVERY frames (60) both hash all of EE RAM at the vblank and compare: a difference is a
++// desync, logged with its frame.
++//
++//   PS2X_NET_PLAYER=1|2                 which player is local (1 = port 1, 2 = port 2)
++//   PS2X_NET_RELAY=<host:port> PS2X_NET_TOKEN=<32 hex>   through the online server's relay (RLY1, see server/relay.go)
++//   PS2X_NET=<host:port> / PS2X_NET_LISTEN=<port>        direct, for tests on one machine or a LAN
++//   PS2X_NET_DELAY=<frames>|auto        input delay (auto: player 1 measures the round trip and tells player 2)
++//   PS2X_NET_WAIT_MS=<ms>               how long to wait for the other player at the start (default 60000)
++//   PS2X_NET_TIMEOUT=<ms>               silence that ends the match during play (default 10000)
++//   PS2X_NET_STATUS_FILE=<path>         "online" once both play, "offline <why>" when the match ends (the launcher)
++
++#include "NetPlay.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++#if defined(_WIN32)
++#  define WIN32_LEAN_AND_MEAN
++#  define NOMINMAX
++#  include <winsock2.h>
++#  include <ws2tcpip.h>
++#  if defined(_MSC_VER)
++#    pragma comment(lib, "ws2_32.lib")
++#  endif
++using socklen_t = int;
++#  define PS2X_NET_CLOSE closesocket
++#else
++#  include <arpa/inet.h>
++#  include <fcntl.h>
++#  include <netdb.h>
++#  include <netinet/in.h>
++#  include <sys/socket.h>
++#  include <unistd.h>
++using SOCKET = int;
++#  define INVALID_SOCKET (-1)
++#  define PS2X_NET_CLOSE ::close
++#endif
++
++
++namespace ps2_gsdump
++{
++    void setNetStatus(uint32_t status); // gs_dump_writer.h (not included: its headers clash with winsock's macros)
++}
++
++namespace ps2_net
++{
++    namespace
++    {
++        using Clock = std::chrono::steady_clock;
++
++        constexpr uint32_t kMagic = 0x4e345242u; // 'BR4N'
++        constexpr uint8_t kVersion = 1u;
++        constexpr uint32_t kRedundancy = 8u;
++        constexpr uint32_t kRing = 512u; // frames kept per side
++        constexpr size_t kEeRamSize = 32u * 1024u * 1024u; // PS2_RAM_SIZE (ps2_runtime.h clashes with winsock's macros)
++
++        enum Kind : uint8_t
++        {
++            kInputs = 0,
++            kPing = 1,
++            kPong = 2,
++            kDelay = 3,
++            kDelayAck = 4,
++            kBye = 5,
++        };
++
++#pragma pack(push, 1)
++        struct WireInput
++        {
++            uint16_t buttons;
++            uint8_t lx, ly, rx, ry;
++        };
++        struct Packet
++        {
++            uint32_t magic;
++            uint8_t version;
++            uint8_t kind;
++            uint8_t player;    // the sender, 1 or 2
++            uint8_t count;     // inputs carried, oldest first
++            uint32_t base;     // frame of inputs[0]
++            uint32_t checkFrame; // frame of checksum (0 = none)
++            uint64_t checksum; // hash of EE RAM at checkFrame's vblank
++            uint64_t value;    // ping/pong: the sender's clock in us; delay: the frames
++            WireInput inputs[kRedundancy];
++        };
++#pragma pack(pop)
++
++        struct Slot
++        {
++            uint32_t frame = 0xFFFFFFFFu;
++            PadSample pad;
++        };
++
++        struct State
++        {
++            bool configured = false, started = false, online = false, ended = false;
++            int player = 1;
++            SOCKET sock = INVALID_SOCKET;
++            sockaddr_in peer{};
++            bool peerKnown = false;
++            bool relay = false;
++            bool listen = false;
++            char token[33] = {};
++            bool autoDelay = false;
++            uint32_t delay = 3;
++            uint32_t waitMs = 60000, timeoutMs = 10000, checkEvery = 60;
++            std::string statusPath;
++
++            std::array<Slot, kRing> local{}, remote{};
++            uint32_t firstFrame = 0;  // the vblank lockstep started at
++            uint32_t frame = 0;       // the vblank being played
++            PadSample current[2];     // this frame's input per port
++
++            std::array<std::pair<uint32_t, uint64_t>, 16> ourHash{};
++            uint32_t peerCheckFrame = 0;
++            uint64_t peerChecksum = 0;
++            uint32_t lastCompared = 0;
++            uint64_t desyncs = 0;
++            uint32_t ourCheckFrame = 0;
++            uint64_t ourChecksum = 0;
++
++            Clock::time_point lastRx{};
++            uint64_t stalls = 0, stallUs = 0, rx = 0, tx = 0;
++            uint32_t peerDelay = 0; // player 2: the delay player 1 announced
++            bool delayAcked = false;
++            // the banner the GS host draws (RingHeader::netStatus) and until which vblank
++            uint32_t banner = 0, bannerUntil = 0, lastVsync = 0;
++        };
++
++        State g;
++
++        uint64_t nowUs()
++        {
++            return static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count());
++        }
++
++        const char *env(const char *name)
++        {
++            const char *v = std::getenv(name);
++            return (v && *v) ? v : nullptr;
++        }
++
++        void showBanner(uint32_t status, uint32_t frames)
++        {
++            g.banner = status;
++            g.bannerUntil = g.lastVsync + frames;
++            ps2_gsdump::setNetStatus(status);
++        }
++
++        void writeStatus(const char *line)
++        {
++            if (g.statusPath.empty())
++                return;
++            if (std::FILE *f = std::fopen(g.statusPath.c_str(), "wb"))
++            {
++                std::fputs(line, f);
++                std::fputc('\n', f);
++                std::fclose(f);
++            }
++        }
++
++        bool resolve(const char *hostPort, sockaddr_in &out)
++        {
++            std::string s(hostPort);
++            const size_t colon = s.rfind(':');
++            if (colon == std::string::npos)
++                return false;
++            const std::string host = s.substr(0, colon), port = s.substr(colon + 1);
++            addrinfo hints{};
++            hints.ai_family = AF_INET;
++            hints.ai_socktype = SOCK_DGRAM;
++            addrinfo *res = nullptr;
++            if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res)
++                return false;
++            std::memcpy(&out, res->ai_addr, sizeof(sockaddr_in));
++            freeaddrinfo(res);
++            return true;
++        }
++
++        void configure()
++        {
++            static bool s_done = false;
++            if (s_done)
++                return;
++            s_done = true;
++            const char *p = env("PS2X_NET_PLAYER");
++            if (!p || (p[0] != '1' && p[0] != '2'))
++                return;
++            g.player = p[0] - '0';
++            const char *relay = env("PS2X_NET_RELAY"), *token = env("PS2X_NET_TOKEN");
++            const char *direct = env("PS2X_NET"), *listen = env("PS2X_NET_LISTEN");
++            if (!(relay && token && std::strlen(token) == 32) && !direct && !listen)
++                return;
++            if (const char *d = env("PS2X_NET_DELAY"))
++            {
++                if (std::strcmp(d, "auto") == 0)
++                    g.autoDelay = true;
++                else
++                    g.delay = static_cast<uint32_t>(std::clamp(std::atoi(d), 1, 10));
++            }
++            if (const char *v = env("PS2X_NET_WAIT_MS"))
++                g.waitMs = static_cast<uint32_t>(std::max(1000, std::atoi(v)));
++            if (const char *v = env("PS2X_NET_TIMEOUT"))
++                g.timeoutMs = static_cast<uint32_t>(std::max(1000, std::atoi(v)));
++            if (const char *v = env("PS2X_NET_CHECKEVERY"))
++                g.checkEvery = static_cast<uint32_t>(std::max(1, std::atoi(v)));
++            if (const char *v = env("PS2X_NET_STATUS_FILE"))
++                g.statusPath = v;
++            if (const char *v = env("PS2X_DETERMINISTIC"); !v || v[0] != '1')
++                std::fprintf(stderr, "[net] warning: PS2X_DETERMINISTIC=1 is not set, the two games will not stay the same\n");
++
++#if defined(_WIN32)
++            WSADATA wsa;
++            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
++                return;
++#endif
++            g.sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++            if (g.sock == INVALID_SOCKET)
++                return;
++#if defined(_WIN32)
++            u_long nb = 1;
++            ioctlsocket(g.sock, FIONBIO, &nb);
++#else
++            fcntl(g.sock, F_SETFL, fcntl(g.sock, F_GETFL, 0) | O_NONBLOCK);
++#endif
++            if (relay && token && std::strlen(token) == 32)
++            {
++                g.relay = true;
++                std::memcpy(g.token, token, 32);
++                g.peerKnown = resolve(relay, g.peer);
++            }
++            else if (listen)
++            {
++                sockaddr_in a{};
++                a.sin_family = AF_INET;
++                a.sin_addr.s_addr = htonl(INADDR_ANY);
++                a.sin_port = htons(static_cast<uint16_t>(std::atoi(listen)));
++                if (::bind(g.sock, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0)
++                {
++                    std::fprintf(stderr, "[net] cannot listen on UDP %s\n", listen);
++                    return;
++                }
++                g.listen = true;
++            }
++            else
++            {
++                g.peerKnown = resolve(direct, g.peer);
++            }
++            if (!g.relay && !g.listen && !g.peerKnown)
++            {
++                std::fprintf(stderr, "[net] cannot resolve the peer\n");
++                return;
++            }
++            g.configured = true;
++            std::fprintf(stderr, "[net] player %d via %s, delay %s\n", g.player, g.relay ? "relay" : (g.listen ? "listen" : "direct"),
++                         g.autoDelay ? "auto" : std::to_string(g.delay).c_str());
++        }
++
++        void sendRaw(const void *data, size_t n)
++        {
++            if (!g.peerKnown)
++                return;
++            ::sendto(g.sock, static_cast<const char *>(data), static_cast<int>(n), 0, reinterpret_cast<const sockaddr *>(&g.peer),
++                     sizeof g.peer);
++            ++g.tx;
++        }
++
++        void sendRelayRegistration()
++        {
++            char reg[37];
++            std::memcpy(reg, "RLY1", 4);
++            std::memcpy(reg + 4, g.token, 32);
++            reg[36] = static_cast<char>('0' + g.player);
++            sendRaw(reg, sizeof reg);
++        }
++
++        Packet header(uint8_t kind)
++        {
++            Packet p{};
++            p.magic = kMagic;
++            p.version = kVersion;
++            p.kind = kind;
++            p.player = static_cast<uint8_t>(g.player);
++            p.checkFrame = g.ourCheckFrame;
++            p.checksum = g.ourChecksum;
++            return p;
++        }
++
++        void sendControl(uint8_t kind, uint64_t value)
++        {
++            Packet p = header(kind);
++            p.value = value;
++            sendRaw(&p, sizeof p);
++        }
++
++        // Our inputs up to frame `last` (the newest is the one for frame + delay).
++        void sendInputs(uint32_t last)
++        {
++            Packet p = header(kInputs);
++            const uint32_t first = std::max(g.firstFrame, last >= kRedundancy - 1 ? last - (kRedundancy - 1) : 0u);
++            uint32_t n = 0;
++            for (uint32_t f = first; f <= last && n < kRedundancy; ++f)
++            {
++                const Slot &s = g.local[f % kRing];
++                if (s.frame != f)
++                    continue;
++                if (n == 0)
++                    p.base = f;
++                p.inputs[n++] = WireInput{s.pad.buttons, s.pad.lx, s.pad.ly, s.pad.rx, s.pad.ry};
++            }
++            p.count = static_cast<uint8_t>(n);
++            sendRaw(&p, sizeof p);
++        }
++
++        void compareChecks()
++        {
++            if (g.peerCheckFrame == 0 || g.peerCheckFrame == g.lastCompared)
++                return;
++            for (const auto &[f, h] : g.ourHash)
++            {
++                if (f != g.peerCheckFrame)
++                    continue;
++                g.lastCompared = f;
++                if (h != g.peerChecksum)
++                {
++                    ++g.desyncs;
++                    std::fprintf(stderr, "[net] *** DESYNC at frame %u: ours %016llx, theirs %016llx\n", f,
++                                 static_cast<unsigned long long>(h), static_cast<unsigned long long>(g.peerChecksum));
++                }
++                return;
++            }
++        }
++
++        void handle(const Packet &p, size_t n, std::vector<uint64_t> *rtts)
++        {
++            if (n < offsetof(Packet, inputs) || p.magic != kMagic || p.version != kVersion || p.player != 3 - g.player)
++                return;
++            g.lastRx = Clock::now();
++            ++g.rx;
++            if (p.checkFrame != 0 && p.checkFrame > g.peerCheckFrame)
++            {
++                g.peerCheckFrame = p.checkFrame;
++                g.peerChecksum = p.checksum;
++            }
++            switch (p.kind)
++            {
++            case kInputs:
++                for (uint32_t i = 0; i < p.count && i < kRedundancy; ++i)
++                {
++                    const uint32_t f = p.base + i;
++                    Slot &s = g.remote[f % kRing];
++                    s.frame = f;
++                    s.pad = PadSample{p.inputs[i].buttons, p.inputs[i].lx, p.inputs[i].ly, p.inputs[i].rx, p.inputs[i].ry};
++                }
++                break;
++            case kPing:
++                sendControl(kPong, p.value);
++                break;
++            case kPong:
++                if (rtts && p.value != 0)
++                    rtts->push_back(nowUs() - p.value);
++                break;
++            case kDelay:
++                if (g.player == 2 && p.value >= 1 && p.value <= 10)
++                {
++                    g.peerDelay = static_cast<uint32_t>(p.value);
++                    sendControl(kDelayAck, p.value);
++                }
++                break;
++            case kDelayAck:
++                if (g.player == 1 && p.value == g.delay)
++                    g.delayAcked = true;
++                break;
++            case kBye:
++                if (g.online && !g.ended)
++                {
++                    g.ended = true;
++                    std::fprintf(stderr, "[net] the other player left\n");
++                    writeStatus("offline the other player left");
++                    showBanner(6, 300);
++                }
++                break;
++            default:
++                break;
++            }
++            compareChecks();
++        }
++
++        // Reads every datagram waiting. In listen mode the first valid sender becomes the peer.
++        void pump(std::vector<uint64_t> *rtts = nullptr)
++        {
++            for (;;)
++            {
++                char buf[512];
++                sockaddr_in from{};
++                socklen_t len = sizeof from;
++                const int n = ::recvfrom(g.sock, buf, sizeof buf, 0, reinterpret_cast<sockaddr *>(&from), &len);
++                if (n <= 0)
++                    return;
++                if (g.relay && n == 6 && std::memcmp(buf, "RLYA", 4) == 0)
++                    continue; // the relay's answer to the registration
++                if (static_cast<size_t>(n) < offsetof(Packet, inputs))
++                    continue;
++                Packet p{};
++                std::memcpy(&p, buf, std::min(static_cast<size_t>(n), sizeof p));
++                if (g.listen && !g.peerKnown && p.magic == kMagic && p.player == 3 - g.player)
++                {
++                    g.peer = from;
++                    g.peerKnown = true;
++                }
++                handle(p, static_cast<size_t>(n), rtts);
++            }
++        }
++
++        void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
++
++        void goOffline(const char *why)
++        {
++            if (g.ended)
++                return;
++            g.ended = true;
++            std::fprintf(stderr, "[net] match over: %s (frame %u, stalls %llu, %.1f s waited, desyncs %llu)\n", why, g.frame,
++                         static_cast<unsigned long long>(g.stalls), g.stallUs / 1e6, static_cast<unsigned long long>(g.desyncs));
++            const std::string line = std::string("offline ") + why;
++            writeStatus(line.c_str());
++            showBanner(6, 300);
++            for (int i = 0; i < 3; ++i)
++                sendControl(kBye, 0);
++        }
++
++        void sendByeAtExit()
++        {
++            if (g.online && !g.ended)
++                for (int i = 0; i < 3; ++i)
++                    sendControl(kBye, 0);
++        }
++
++        // The start: both games wait here (their first vblank) for each other, then agree on the delay.
++        void meet(uint32_t vsync)
++        {
++            g.started = true;
++            std::fprintf(stderr, "[net] waiting for the other player (up to %u s)\n", g.waitMs / 1000u);
++            writeStatus("waiting");
++            const auto t0 = Clock::now();
++            auto lastSend = Clock::time_point{};
++            auto lastReg = Clock::time_point{};
++            std::vector<uint64_t> rtts;
++            bool heard = false;
++            for (;;)
++            {
++                const auto now = Clock::now();
++                if (now - t0 > std::chrono::milliseconds(g.waitMs))
++                {
++                    std::fprintf(stderr, "[net] the other player never came\n");
++                    g.ended = true;
++                    writeStatus("offline the other player never came");
++                    showBanner(4, 300);
++                    return;
++                }
++                if (g.relay && now - lastReg > std::chrono::milliseconds(500))
++                {
++                    sendRelayRegistration();
++                    lastReg = now;
++                }
++                if (now - lastSend > std::chrono::milliseconds(heard ? 20 : 100))
++                {
++                    sendControl(kPing, nowUs());
++                    if (g.player == 1 && g.autoDelay && rtts.size() >= 8)
++                        sendControl(kDelay, g.delay);
++                    lastSend = now;
++                }
++                pump(&rtts);
++                heard = g.rx > 0;
++                ps2_gsdump::setNetStatus(2); // every pass: the GS host's ring may open while we wait
++                if (heard)
++                {
++                    if (g.player == 1 && g.autoDelay && rtts.size() >= 8 && !g.delayAcked)
++                    {
++                        std::vector<uint64_t> s(rtts.begin(), rtts.begin() + 8);
++                        std::sort(s.begin(), s.end());
++                        const double oneWayMs = s[4] / 2000.0;
++                        g.delay = static_cast<uint32_t>(std::clamp(static_cast<int>(std::ceil((oneWayMs + 8.0) / 16.667)), 1, 8));
++                    }
++                    const bool delayAgreed = !g.autoDelay || (g.player == 1 ? g.delayAcked : g.peerDelay != 0);
++                    if (delayAgreed)
++                        break;
++                }
++                sleepMs(2);
++            }
++            if (g.autoDelay && g.player == 2)
++                g.delay = g.peerDelay;
++            g.firstFrame = vsync;
++            g.online = true;
++            g.lastRx = Clock::now();
++            std::atexit(sendByeAtExit);
++            showBanner(3, 180);
++            std::fprintf(stderr, "[net] online from frame %u, delay %u frames, waited %.1f s\n", vsync, g.delay,
++                         std::chrono::duration<double>(Clock::now() - t0).count());
++            writeStatus("online");
++        }
++
++        uint64_t hashRam(const uint8_t *p, size_t n)
++        {
++            uint64_t h = 1469598103934665603ull;
++            const uint64_t *w = reinterpret_cast<const uint64_t *>(p);
++            for (size_t i = 0; i < n / 8u; ++i)
++                h = (h ^ w[i]) * 1099511628211ull;
++            return h;
++        }
++    }
++
++    bool enabled()
++    {
++        configure();
++        return g.configured;
++    }
++
++    void onVsync(uint64_t vsync64, const uint8_t *rdram, PS2Runtime *runtime)
++    {
++        if (!enabled())
++            return;
++        const uint32_t vsync = static_cast<uint32_t>(vsync64);
++        g.lastVsync = vsync;
++        if (!g.started)
++            meet(vsync);
++        if (g.banner != 0 && vsync >= g.bannerUntil)
++            g.banner = 0;
++        ps2_gsdump::setNetStatus(g.banner);
++        const PadSample mine = sampleLocalPad(runtime);
++        const int myPort = g.player - 1;
++        if (!g.online || g.ended)
++        {
++            // offline (the other player never came or left): the local pad plays its own port, the other one idles
++            g.current[myPort] = mine;
++            g.current[1 - myPort] = PadSample{};
++            return;
++        }
++        g.frame = vsync;
++
++        // the hash first: it is the state both games reached with the same inputs
++        if (rdram && ((vsync - g.firstFrame) % g.checkEvery) == 0u && vsync != g.firstFrame)
++        {
++            const uint64_t h = hashRam(rdram, kEeRamSize);
++            g.ourHash[(vsync / g.checkEvery) % g.ourHash.size()] = {vsync, h};
++            g.ourCheckFrame = vsync;
++            g.ourChecksum = h;
++            compareChecks();
++        }
++
++        const uint32_t target = vsync + g.delay;
++        g.local[target % kRing] = Slot{target, mine};
++        sendInputs(target);
++
++        PadSample theirs{};
++        if (vsync >= g.firstFrame + g.delay)
++        {
++            const auto t0 = Clock::now();
++            auto lastSend = t0;
++            bool stalled = false;
++            for (;;)
++            {
++                pump();
++                if (g.ended)
++                    break;
++                const Slot &s = g.remote[vsync % kRing];
++                if (s.frame == vsync)
++                {
++                    theirs = s.pad;
++                    break;
++                }
++                const auto now = Clock::now();
++                if (!stalled)
++                {
++                    stalled = true;
++                    ++g.stalls;
++                }
++                if (now - g.lastRx > std::chrono::milliseconds(g.timeoutMs))
++                {
++                    goOffline("the other player stopped answering");
++                    break;
++                }
++                if (now - lastSend > std::chrono::milliseconds(15))
++                {
++                    sendInputs(target); // the other side may have lost ours
++                    lastSend = now;
++                }
++                std::this_thread::sleep_for(std::chrono::microseconds(500));
++            }
++            if (stalled)
++                g.stallUs += static_cast<uint64_t>(
++                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
++        }
++        else
++        {
++            pump();
++        }
++        if (g.ended)
++        {
++            g.current[myPort] = mine;
++            g.current[1 - myPort] = PadSample{};
++            return;
++        }
++
++        const Slot &own = g.local[vsync % kRing];
++        g.current[myPort] = own.frame == vsync ? own.pad : PadSample{};
++        g.current[1 - myPort] = theirs;
++
++        if (((vsync - g.firstFrame) % 600u) == 0u && vsync != g.firstFrame)
++            std::fprintf(stderr, "[net] frame %u: stalls %llu (%.1f s), rx %llu tx %llu, desyncs %llu\n", vsync,
++                         static_cast<unsigned long long>(g.stalls), g.stallUs / 1e6, static_cast<unsigned long long>(g.rx),
++                         static_cast<unsigned long long>(g.tx), static_cast<unsigned long long>(g.desyncs));
++    }
++
++    bool padFor(int port, PadSample &out)
++    {
++        if (!g.configured || port < 0 || port > 1)
++            return false;
++        out = g.current[port];
++        return true;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Net/NetPlay.h b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.h
+new file mode 100644
+index 000000000..653d0f663
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++// [netplay] Two-player online play by input lockstep (PS2X_DETERMINISTIC=1 makes both games the same function of
++// their inputs; see NetPlay.cpp).
++
++#include <cstdint>
++
++class PS2Runtime;
++
++namespace ps2_net
++{
++    // One pad's input for one frame: what crosses the network.
++    struct PadSample
++    {
++        uint16_t buttons = 0xFFFFu; // active-low, as the pad reports it
++        uint8_t lx = 0x80u, ly = 0x80u, rx = 0x80u, ry = 0x80u;
++    };
++
++    // PS2X_NET_PLAYER=1|2 and a transport (PS2X_NET_RELAY + PS2X_NET_TOKEN, PS2X_NET=<host:port> or
++    // PS2X_NET_LISTEN=<port>). Read once.
++    bool enabled();
++
++    // The local player's pad right now (host controller, keyboard, GS host window, PS2X_PAD_SCRIPT). In Pad.cpp.
++    PadSample sampleLocalPad(PS2Runtime *runtime);
++
++    // At every VBlankStart, on the EE executor thread: sends this frame's local input and waits for the other
++    // player's. Blocks the game while the other one is behind.
++    void onVsync(uint64_t vsync, const uint8_t *rdram, PS2Runtime *runtime);
++
++    // The input a pad port reads this frame while netplay runs (port 0 = player 1, port 1 = player 2).
++    bool padFor(int port, PadSample &out);
++}
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
 index 56a978eae..8150405d6 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
@@ -29182,10 +29872,10 @@ index b1bb6d851..dd9848304 100644
      }
  
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index 44eaef4d9..1847e136e 100644
+index 44eaef4d9..2c06e8ee6 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-@@ -483,6 +483,18 @@ namespace ps2_stubs
+@@ -483,6 +483,21 @@ namespace ps2_stubs
          constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
          constexpr size_t kMpegTimingScanLimit = 4096u;
          constexpr size_t kMaxDecodedPicturesAhead = 8u;
@@ -29193,7 +29883,10 @@ index 44eaef4d9..1847e136e 100644
 +        // the queue drains. The demuxer must keep consuming meanwhile: the same PSS carries the audio
 +        // (Bloody Roar 4 interleaves it well ahead of the video and clocks the pictures by the audio
 +        // position, so holding the stream back for video starved the audio and froze the movie).
-+        constexpr size_t kMaxPendingVideoBytes = 8u * 1024u * 1024u;
++        // The cap is above any movie's size (compressed bytes only): at 8 MB, Bloody Roar 4's long attract movie (31 MB)
++        // hit it, demux returned 0 consumed, the game's stream ring (0x50000) stayed full, sceCdStRead stopped, the
++        // game never called demux again and GetPicture waited forever on one frame.
++        constexpr size_t kMaxPendingVideoBytes = 256u * 1024u * 1024u;
 +
 +        struct MpegPendingVideo
 +        {
@@ -29204,7 +29897,7 @@ index 44eaef4d9..1847e136e 100644
  
          struct MpegPlaybackState
          {
-@@ -492,6 +504,14 @@ namespace ps2_stubs
+@@ -492,6 +507,14 @@ namespace ps2_stubs
              uint32_t decodeMode = 0u;
              uint32_t imageBufferAddr = 0u;
              bool sawInput = false;
@@ -29219,7 +29912,7 @@ index 44eaef4d9..1847e136e 100644
              bool sawSequenceEnd = false;
              bool streamEnded = false;
              bool decoderFailed = false;
-@@ -501,6 +521,8 @@ namespace ps2_stubs
+@@ -501,6 +524,8 @@ namespace ps2_stubs
              std::vector<uint8_t> pssBuffer;
              std::vector<uint32_t> pssGuestAddrs;
              std::deque<MpegDecodedFrame> decodedFrames;
@@ -29228,7 +29921,7 @@ index 44eaef4d9..1847e136e 100644
              std::unique_ptr<MpegFfmpegDecoder> decoder;
              uint8_t frameRateCode = 0u;
              uint8_t frameRateExtensionN = 0u;
-@@ -796,9 +818,15 @@ namespace ps2_stubs
+@@ -796,9 +821,15 @@ namespace ps2_stubs
              return readStackArg(rdram, ctx, 0x10u);
          }
  
@@ -29245,7 +29938,7 @@ index 44eaef4d9..1847e136e 100644
          }
  
          MpegPlaybackState makeFreshPlaybackState()
-@@ -1006,7 +1034,7 @@ namespace ps2_stubs
+@@ -1006,7 +1037,7 @@ namespace ps2_stubs
  
          void flushDecoderIfEnded(MpegPlaybackState &playback)
          {
@@ -29254,7 +29947,7 @@ index 44eaef4d9..1847e136e 100644
              {
                  playback.decoder->flush(playback.decodedFrames);
              }
-@@ -1110,6 +1138,35 @@ namespace ps2_stubs
+@@ -1110,6 +1141,35 @@ namespace ps2_stubs
              flushDecoderIfEnded(playback);
          }
  
@@ -29290,7 +29983,7 @@ index 44eaef4d9..1847e136e 100644
          void erasePssPrefix(MpegPlaybackState &playback, size_t count)
          {
              std::vector<uint8_t> &buffer = playback.pssBuffer;
-@@ -1331,7 +1388,7 @@ namespace ps2_stubs
+@@ -1331,7 +1391,7 @@ namespace ps2_stubs
                                  pes.pts90k,
                                  pes.dts90k);
                          }
@@ -29299,7 +29992,7 @@ index 44eaef4d9..1847e136e 100644
                              playback,
                              buffer.data() + payloadStart,
                              packetEnd - payloadStart,
-@@ -1394,6 +1451,35 @@ namespace ps2_stubs
+@@ -1394,6 +1454,52 @@ namespace ps2_stubs
              }
          }
  
@@ -29311,15 +30004,32 @@ index 44eaef4d9..1847e136e 100644
 +            uint64_t demuxBytes = 0u;
 +            uint64_t pictures = 0u;
 +            uint64_t pictureWaits = 0u;
++            uint32_t lastRingBase = 0u;
++            uint32_t lastRingSize = 0u;
 +        } g_mpegActivity;
 +
-+        void reportMpegActivityUnlocked(uint32_t mpegAddr, const MpegPlaybackState &playback)
++        void reportMpegActivityUnlocked(const uint8_t *rdram, uint32_t mpegAddr, const MpegPlaybackState &playback)
 +        {
 +            static auto s_last = std::chrono::steady_clock::now();
 +            const auto now = std::chrono::steady_clock::now();
 +            if (now - s_last < std::chrono::seconds(2))
 +                return;
 +            s_last = now;
++            // The game's ring descriptor follows its data (Bloody Roar 4: write offset, count, size).
++            uint32_t ringWords[3] = {};
++            if (rdram && g_mpegActivity.lastRingBase != 0u && g_mpegActivity.lastRingSize != 0u)
++            {
++                for (uint32_t i = 0; i < 3u; ++i)
++                    if (const uint8_t *p = getConstMemPtr(rdram, g_mpegActivity.lastRingBase + g_mpegActivity.lastRingSize + i * 4u))
++                        std::memcpy(&ringWords[i], p, 4u);
++            }
++            uint32_t playerState = 0u; // Bloody Roar 4's movie loop state word (0x30981C; 1+ = CD error recovery)
++            if (rdram)
++                if (const uint8_t *p = getConstMemPtr(rdram, 0x30981Cu))
++                    std::memcpy(&playerState, p, 4u);
++            std::cerr << "[MPEG:ring] base=0x" << std::hex << g_mpegActivity.lastRingBase << " wr=0x" << ringWords[0]
++                      << " count=0x" << ringWords[1] << " size=0x" << ringWords[2] << " state=0x" << playerState << std::dec
++                      << std::endl;
 +            std::cerr << "[MPEG:status] mpeg=0x" << std::hex << mpegAddr << std::dec
 +                      << " demux=" << g_mpegActivity.demuxCalls << "/" << g_mpegActivity.demuxBackpressured
 +                      << " bytes=" << g_mpegActivity.demuxBytes
@@ -29335,19 +30045,25 @@ index 44eaef4d9..1847e136e 100644
          bool mpegDemuxBackpressured(const MpegPlaybackState &playback)
          {
              // Let EOF finalization drain any tail that is already in the guest
-@@ -1409,8 +1495,10 @@ namespace ps2_stubs
+@@ -1409,8 +1515,16 @@ namespace ps2_stubs
              // lets the game's producer loop wake the consumer again. Backpressure
              // still propagates naturally to sceCdStRead because the ring does not
              // advance while this is true.
 +            // Pictures beyond kMaxDecodedPicturesAhead wait compressed (feedOrDeferVideo), so the
 +            // limit here is on those bytes: the audio interleaved in the stream keeps flowing.
++            // PS2X_MPEG_PENDING_CAP_MB=n overrides the cap (diagnostics).
++            static const size_t s_cap = []
++            {
++                const char *env = std::getenv("PS2X_MPEG_PENDING_CAP_MB");
++                return env && env[0] ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) << 20u : kMaxPendingVideoBytes;
++            }();
              return !g_mpeg_stub_state.currentCdStreamEofSeen &&
 -                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
-+                   playback.pendingVideoBytes >= kMaxPendingVideoBytes;
++                   playback.pendingVideoBytes >= s_cap;
          }
  
          void recordCdStreamBytesDemuxedUnlocked(
-@@ -1620,6 +1708,104 @@ namespace ps2_stubs
+@@ -1620,6 +1734,104 @@ namespace ps2_stubs
              runtime->eeScheduler().queueInvocation(std::move(invocation));
          }
  
@@ -29452,7 +30168,7 @@ index 44eaef4d9..1847e136e 100644
          void dispatchStreamCallbacks(uint8_t *rdram,
                                       R5900Context *ctx,
                                       PS2Runtime *runtime,
-@@ -1885,6 +2071,37 @@ namespace ps2_stubs
+@@ -1885,6 +2097,37 @@ namespace ps2_stubs
              std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
              MpegPlaybackState &playback = getPlaybackState(mpegAddr);
              const size_t framesBefore = playback.decodedFrames.size();
@@ -29490,7 +30206,7 @@ index 44eaef4d9..1847e136e 100644
              while (copied < byteCount)
              {
                  const uint32_t curAddr = dataAddr + static_cast<uint32_t>(copied);
-@@ -1898,6 +2115,14 @@ namespace ps2_stubs
+@@ -1898,6 +2141,14 @@ namespace ps2_stubs
                  feedElementaryStream(playback, src, chunk);
                  copied += chunk;
              }
@@ -29505,7 +30221,7 @@ index 44eaef4d9..1847e136e 100644
              wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
          }
  
-@@ -2045,14 +2270,24 @@ namespace ps2_stubs
+@@ -2045,14 +2296,24 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, uVar3 + 0x80, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, uVar3 + 0x94, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, uVar3 + 0x98, 0xFFFFFFFFu);
@@ -29536,25 +30252,27 @@ index 44eaef4d9..1847e136e 100644
  
          uint32_t setDynamicRet = a1_init;
          if (uint8_t *p = getMemPtr(rdram, puVar4 + 8))
-@@ -2191,6 +2426,10 @@ namespace ps2_stubs
+@@ -2191,6 +2452,12 @@ namespace ps2_stubs
                      callbackEvents);
                  recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
              }
 +            ++g_mpegActivity.demuxCalls;
 +            g_mpegActivity.demuxBackpressured += backpressured ? 1u : 0u;
 +            g_mpegActivity.demuxBytes += consumed;
-+            reportMpegActivityUnlocked(mpegAddr, playback);
++            g_mpegActivity.lastRingBase = ringBaseAddr;
++            g_mpegActivity.lastRingSize = ringSize;
++            reportMpegActivityUnlocked(rdram, mpegAddr, playback);
              decodedCount = playback.decodedFrames.size();
              traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
          }
-@@ -2292,11 +2531,17 @@ namespace ps2_stubs
+@@ -2292,11 +2559,17 @@ namespace ps2_stubs
          {
              std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
              MpegPlaybackState &playback = getPlaybackState(mpegAddr);
 +            const bool returnWithoutPicture = playback.returnWithoutPicture;
 +            playback.returnWithoutPicture = false;
 +            ++g_mpegActivity.pictures;
-+            reportMpegActivityUnlocked(mpegAddr, playback);
++            reportMpegActivityUnlocked(rdram, mpegAddr, playback);
              if (playback.decodedFrames.empty() &&
 +                !returnWithoutPicture &&
                  !g_mpeg_stub_state.currentCdStreamEofSeen &&
@@ -29565,7 +30283,7 @@ index 44eaef4d9..1847e136e 100644
                  if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                  {
                      PS2_IF_AGRESSIVE_LOGS({
-@@ -2308,6 +2553,7 @@ namespace ps2_stubs
+@@ -2308,6 +2581,7 @@ namespace ps2_stubs
                      ++g_mpeg_stub_state.getPictureWaitTraceCount;
                  }
                  lock.unlock();
@@ -29573,7 +30291,7 @@ index 44eaef4d9..1847e136e 100644
                  runtime->eeScheduler().waitExternal(
                      EeWaitReason::Mpeg,
                      kMpegPictureWaitType,
-@@ -2392,6 +2638,37 @@ namespace ps2_stubs
+@@ -2392,6 +2666,37 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
          mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
          mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
@@ -29611,7 +30329,7 @@ index 44eaef4d9..1847e136e 100644
  
          if (uint8_t *base = getMemPtr(rdram, mpegAddr))
          {
-@@ -2532,7 +2809,9 @@ namespace ps2_stubs
+@@ -2532,7 +2837,9 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, param_1 + 0x08, 0u);
          mpegGuestWrite32(rdram, inner + 0x80, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, inner + 0xAC, 0u);
@@ -29781,13 +30499,14 @@ index 564d87381..a414c5439 100644
      }
  
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
-index b50a4cf6a..339fef1a0 100644
+index b50a4cf6a..391ec6ac5 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
-@@ -1,5 +1,17 @@
+@@ -1,5 +1,18 @@
  #include "Common.h"
  #include "Pad.h"
 +#include "../../gs/gs_dump_writer.h"
++#include "../Net/NetPlay.h"
 +
 +#include <cctype>
 +#include <chrono>
@@ -29802,7 +30521,7 @@ index b50a4cf6a..339fef1a0 100644
  
  namespace ps2_stubs
  {
-@@ -7,6 +19,9 @@ namespace ps2_stubs
+@@ -7,6 +20,9 @@ namespace ps2_stubs
      {
          constexpr uint8_t kPadModeDigital = 0x41;
          constexpr uint8_t kPadModeDualShock = 0x73;
@@ -29812,7 +30531,7 @@ index b50a4cf6a..339fef1a0 100644
          constexpr uint8_t kPadAnalogCenter = 0x80;
          constexpr int32_t kPadTypeDigital = 4;
          constexpr int32_t kPadTypeDualShock = 7;
-@@ -67,6 +82,19 @@ namespace ps2_stubs
+@@ -67,6 +83,19 @@ namespace ps2_stubs
          PadPortState g_padPorts[kPadPortCount]{};
          int g_padReadLogCount = 0;
  
@@ -29832,7 +30551,7 @@ index b50a4cf6a..339fef1a0 100644
          uint8_t axisToByte(float axis)
          {
              axis = std::clamp(axis, -1.0f, 1.0f);
-@@ -82,8 +110,98 @@ namespace ps2_stubs
+@@ -82,8 +111,98 @@ namespace ps2_stubs
              }
          }
  
@@ -29931,7 +30650,7 @@ index b50a4cf6a..339fef1a0 100644
              for (int i = 0; i < 4; ++i)
              {
                  if (IsGamepadAvailable(i))
-@@ -216,7 +334,7 @@ namespace ps2_stubs
+@@ -216,7 +335,7 @@ namespace ps2_stubs
          void initializePadPortLocked(PadPortState &portState, uint32_t dmaAddr)
          {
              portState.open = true;
@@ -29940,7 +30659,7 @@ index b50a4cf6a..339fef1a0 100644
              portState.pressureEnabled = false;
              portState.buttonMask = 0xFFFFu;
              portState.dmaAddr = dmaAddr;
-@@ -245,7 +363,8 @@ namespace ps2_stubs
+@@ -245,7 +364,8 @@ namespace ps2_stubs
          void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
          {
              std::memset(data, 0, 32);
@@ -29950,7 +30669,7 @@ index b50a4cf6a..339fef1a0 100644
              data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
              data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
              data[4] = state.rx;
-@@ -260,9 +379,10 @@ namespace ps2_stubs
+@@ -260,12 +380,70 @@ namespace ps2_stubs
              data[13] = pressureValue(state, portState, kPadBtnCircle);
              data[14] = pressureValue(state, portState, kPadBtnCross);
              data[15] = pressureValue(state, portState, kPadBtnSquare);
@@ -29963,17 +30682,16 @@ index b50a4cf6a..339fef1a0 100644
              data[19] = pressureValue(state, portState, kPadBtnR2);
          }
  
-@@ -296,10 +416,24 @@ namespace ps2_stubs
-             }
- 
-             bool usedBackend = false;
--            if (!useOverride)
++        // The host side of a pad: the controller backend, raylib's gamepad/keyboard, the GS host window's keys (port 0)
++        // and PS2X_PAD_SCRIPT (port 0). Offline this is what the port reads; online it is the local player's sample.
++        PadInputState readHostPad(int port, int slot, PS2Runtime *runtime, const PadPortState &portState, bool &usedBackend)
++        {
++            PadInputState state;
 +            // The GS host's options menu owns the controls while it is open.
 +            const bool menuOpen = port == 0 && ps2_gsdump::hostMenuOpen();
-+            if (!useOverride && !menuOpen)
-             {
-                 uint8_t backendData[32]{};
--                if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
++            if (!menuOpen)
++            {
++                uint8_t backendData[32]{};
 +                // PS2X_NO_GAMEPAD=1 also mutes the controller backend (automated tests).
 +                static const bool s_noPadBackend = []
 +                {
@@ -29987,13 +30705,18 @@ index b50a4cf6a..339fef1a0 100644
 +                    // already focus-bound).
 +                }
 +                else if (!s_noPadBackend && runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
-                 {
-                     state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
-                     state.rx = backendData[4];
-@@ -312,11 +446,46 @@ namespace ps2_stubs
-                 {
-                     applyGamepadState(state);
-                     applyKeyboardState(state, portState.analogMode);
++                {
++                    state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
++                    state.rx = backendData[4];
++                    state.ry = backendData[5];
++                    state.lx = backendData[6];
++                    state.ly = backendData[7];
++                    usedBackend = true;
++                }
++                else
++                {
++                    applyGamepadState(state);
++                    applyKeyboardState(state, portState.analogMode);
 +                    // With the PCSX2 GS host window in front, the keyboard goes to it and
 +                    // comes back through the live ring.
 +                    uint32_t remoteButtons = 0u;
@@ -30009,35 +30732,89 @@ index b50a4cf6a..339fef1a0 100644
 +                            state.ry = static_cast<uint8_t>(remoteAxes >> 24);
 +                        }
 +                    }
-                 }
-             }
- 
++                }
++            }
 +            if (port == 0)
 +                applyPadScript(state);
++            return state;
++        }
 +
-             fillPadStatus(outData, state, portState);
+         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
+         {
+             if (!outData)
+@@ -286,37 +464,50 @@ namespace ps2_stubs
  
+             PadInputState state;
+             bool useOverride = false;
++            bool usedBackend = false;
++            ps2_net::PadSample net;
++            if (ps2_net::enabled() && ps2_net::padFor(port, net))
++            {
++                // [netplay] online, both ports play this frame's inputs (the local pad was sampled at the vblank)
++                state.buttons = net.buttons;
++                state.lx = net.lx;
++                state.ly = net.ly;
++                state.rx = net.rx;
++                state.ry = net.ry;
++            }
++            else
+             {
+-                std::lock_guard<std::mutex> lock(g_padOverrideMutex);
+-                if (g_padOverrideEnabled)
+                 {
+-                    state = g_padOverrideState;
+-                    useOverride = true;
++                    std::lock_guard<std::mutex> lock(g_padOverrideMutex);
++                    if (g_padOverrideEnabled)
++                    {
++                        state = g_padOverrideState;
++                        useOverride = true;
++                    }
+                 }
++                if (!useOverride)
++                    state = readHostPad(port, slot, runtime, portState, usedBackend);
+             }
+ 
+-            bool usedBackend = false;
+-            if (!useOverride)
++            fillPadStatus(outData, state, portState);
++
 +            // PS2X_PAD_LOG=1: what the game reads, whenever it changes.
 +            static const bool s_padLog = [] { const char *e = std::getenv("PS2X_PAD_LOG"); return e && e[0] == '1'; }();
 +            if (s_padLog)
-+            {
+             {
+-                uint8_t backendData[32]{};
+-                if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
+-                {
+-                    state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
+-                    state.rx = backendData[4];
+-                    state.ry = backendData[5];
+-                    state.lx = backendData[6];
+-                    state.ly = backendData[7];
+-                    usedBackend = true;
+-                }
+-                else
 +                static uint32_t s_last[8]{};
 +                const uint32_t key = static_cast<uint32_t>(state.buttons) | (static_cast<uint32_t>(outData[1]) << 16) |
 +                                     (portState.pressureEnabled ? 0x1000000u : 0u);
 +                const uint32_t idx = static_cast<uint32_t>((port & 1) * 4 + (slot & 3));
 +                if (s_last[idx] != key)
-+                {
+                 {
+-                    applyGamepadState(state);
+-                    applyKeyboardState(state, portState.analogMode);
 +                    s_last[idx] = key;
 +                    std::fprintf(stderr, "[pad] port=%d slot=%d mode=0x%02X btn=0x%04X press=%d lx=%u ly=%u x=%u sq=%u\n", port, slot,
 +                                 outData[1], static_cast<unsigned>(state.buttons ^ 0xFFFFu), portState.pressureEnabled ? 1 : 0,
 +                                 state.lx, state.ly, outData[14], outData[15]);
-+                }
-+            }
-+
+                 }
+             }
+ 
+-            fillPadStatus(outData, state, portState);
+-
              {
                  std::lock_guard<std::mutex> lock(g_padStateMutex);
                  if (PadPortState *sharedPortState = lookupPadPortStateLocked(port, slot))
-@@ -610,7 +779,7 @@ namespace ps2_stubs
+@@ -610,7 +801,7 @@ namespace ps2_stubs
          }
  
          portState->open = true;
@@ -30046,7 +30823,7 @@ index b50a4cf6a..339fef1a0 100644
          portState->pressureEnabled = false;
          portState->buttonMask = 0xFFFFu;
          portState->dmaAddr = dmaAddr;
-@@ -635,6 +804,12 @@ namespace ps2_stubs
+@@ -635,6 +826,12 @@ namespace ps2_stubs
              setReturnS32(ctx, 0);
              return;
          }
@@ -30059,7 +30836,7 @@ index b50a4cf6a..339fef1a0 100644
  
          ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
          if (!readPadPortData(port, slot, runtime, data, dataAddr))
-@@ -728,7 +903,7 @@ namespace ps2_stubs
+@@ -728,7 +925,7 @@ namespace ps2_stubs
              return;
          }
  
@@ -30068,6 +30845,30 @@ index b50a4cf6a..339fef1a0 100644
          portState->reqState = 0u;
          queueExecCmdStateLocked(*portState);
          setReturnS32(ctx, 1);
+@@ -861,3 +1058,23 @@ namespace ps2_stubs
+         g_padOverrideState = PadInputState{};
+     }
+ }
++
++namespace ps2_net
++{
++    // [netplay] The local player's pad, sampled at the vblank: always the host's port 1 controls (keyboard, first
++    // controller, the GS host window, PS2X_PAD_SCRIPT), whichever port the player plays on.
++    PadSample sampleLocalPad(PS2Runtime *runtime)
++    {
++        using namespace ps2_stubs;
++        PadPortState portState;
++        {
++            std::lock_guard<std::mutex> lock(g_padStateMutex);
++            portState = g_padPorts[0];
++        }
++        if (!portState.open)
++            portState.analogMode = padForcedAnalog();
++        bool usedBackend = false;
++        const PadInputState s = readHostPad(0, 0, runtime, portState, usedBackend);
++        return PadSample{s.buttons, s.lx, s.ly, s.rx, s.ry};
++    }
++}
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
 index dc975edb5..4db3b5267 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
@@ -30887,10 +31688,10 @@ index f0ad5070b..4f31ff126 100644
              {
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 new file mode 100644
-index 000000000..da6b49128
+index 000000000..a0c129644
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-@@ -0,0 +1,1099 @@
+@@ -0,0 +1,1109 @@
 +#include "gs_dump_writer.h"
 +#include "ps2_live_ring.h"
 +
@@ -31616,6 +32417,16 @@ index 000000000..da6b49128
 +#endif
 +    }
 +
++    void setNetStatus(uint32_t status)
++    {
++#if defined(PS2X_GS_LIVE_RING)
++        Writer &w = writer();
++        if (w.liveActive && w.live.header)
++            w.live.header->netStatus = status;
++#else
++        (void)status;
++#endif
++    }
 +    bool inputFocused()
 +    {
 +#if defined(_WIN32)
@@ -31992,10 +32803,10 @@ index 000000000..da6b49128
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.h b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
 new file mode 100644
-index 000000000..5e2471a54
+index 000000000..725c9a5ec
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,62 @@
 +#pragma once
 +
 +#include "runtime/ps2_byte_span.h"
@@ -32025,6 +32836,9 @@ index 000000000..5e2471a54
 +    bool remotePad(uint32_t &buttons, uint32_t &axes);
 +    // The GS host's options menu is open (it owns keyboard and gamepad): give the game no input.
 +    bool hostMenuOpen();
++    // [netplay] The online banner the GS host draws over the game (RingHeader::netStatus: 2 waiting for the other player,
++    // 3 connected, 4 could not connect, 6 the connection was lost; 0 none).
++    void setNetStatus(uint32_t status);
 +    // The physical controller belongs to this instance: its GS host window (or no host) is in front.
 +    // Two instances on one PC must not both follow the same gamepad.
 +    bool inputFocused();
@@ -32075,10 +32889,10 @@ index c289ba0f2..e5ac8dcf1 100644
      }
 diff --git a/ps2xRuntime/src/lib/gs/ps2_live_ring.h b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
 new file mode 100644
-index 000000000..fac0c83c9
+index 000000000..2ccd49267
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,175 @@
 +#pragma once
 +
 +// Shared-memory ring between the PS2Recomp runtime (producer) and the PCSX2-based GS host
@@ -32139,6 +32953,9 @@ index 000000000..fac0c83c9
 +        // the game clears it once applied. Both fit in the padding of this cache line: the layout is unchanged.
 +        volatile uint32_t gameFps60;
 +        volatile uint32_t fps60Request;
++        // Online status the host draws as a banner over the game (same field as the shared host's Ps2LiveRing.h):
++        // 0 none, 2 waiting for the other player, 3 connected, 4 could not connect, 6 the connection was lost.
++        volatile uint32_t netStatus;
 +    };
 +    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
 +
