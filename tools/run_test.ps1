@@ -8,6 +8,7 @@ param(
     [string]$Tag = "test",
     [string]$Ini = "br4.ini",
     [hashtable]$Env = @{},
+    [string]$Elf = '', # the game's ELF (default <Root>\game\iso\SLES_518.77); the disc comes from PS2X_CD_IMAGE
     [string]$Root = $(if ($env:BR4_ROOT) { $env:BR4_ROOT } else { 'C:\BloodyRoar4Recomp' })
 )
 $R = $Root
@@ -29,7 +30,8 @@ $env:PS2X_SHOT_DIR = $out
 $env:PS2X_HOST_NOACTIVATE = "1"
 foreach ($k in $Env.Keys) { Set-Item "env:$k" $Env[$k] }
 
-$p = Start-Process "$rt\ps2EntryRunner.exe" -ArgumentList "`"$R\game\iso\SLES_518.77`"" -WorkingDirectory "$R\game\iso" `
+if (-not $Elf) { $Elf = "$R\game\iso\SLES_518.77" }
+$p = Start-Process "$rt\ps2EntryRunner.exe" -ArgumentList "`"$Elf`"" -WorkingDirectory (Split-Path -Parent $Elf) `
      -RedirectStandardOutput "$out\stdout.log" -RedirectStandardError "$out\stderr.log" -PassThru -WindowStyle Minimized
 $t0 = Get-Date
 $pending = [System.Collections.Generic.List[double]]::new(); $Shots | ForEach-Object { $pending.Add($_) }
