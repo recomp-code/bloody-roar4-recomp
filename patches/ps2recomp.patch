@@ -28509,10 +28509,10 @@ index c5e31c48d..db377415c 100644
  }
 diff --git a/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp
 new file mode 100644
-index 000000000..96627ad7c
+index 000000000..012456bf3
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,656 @@
 +// [netplay] Online play for two players by input lockstep.
 +//
 +// MODEL: the two games never exchange game state, only the pads. With PS2X_DETERMINISTIC=1 a game is a function of its
@@ -28584,7 +28584,7 @@ index 000000000..96627ad7c
 +        using Clock = std::chrono::steady_clock;
 +
 +        constexpr uint32_t kMagic = 0x4e345242u; // 'BR4N'
-+        constexpr uint8_t kVersion = 1u;
++        constexpr uint8_t kVersion = 2u; // 2: the RAM hash in 8 lanes (hashRam)
 +        constexpr uint32_t kRedundancy = 8u;
 +        constexpr uint32_t kRing = 512u; // frames kept per side
 +        constexpr size_t kEeRamSize = 32u * 1024u * 1024u; // PS2_RAM_SIZE (ps2_runtime.h clashes with winsock's macros)
@@ -29035,13 +29035,27 @@ index 000000000..96627ad7c
 +            writeStatus("online");
 +        }
 +
++        // FNV-1a over 64-bit words in 8 independent lanes (word i goes to lane i % 8), folded at the end. One chain of 4M
++        // dependent multiplies took ~4.5 ms at the vblank once a second; the lanes run side by side, so the 32 MB read
++        // is the limit. Integers only: the same value on every machine. Protocol version 2 (version 1 was one lane).
 +        uint64_t hashRam(const uint8_t *p, size_t n)
 +        {
-+            uint64_t h = 1469598103934665603ull;
++            constexpr uint64_t kBasis = 1469598103934665603ull, kPrime = 1099511628211ull;
++            uint64_t h[8];
++            for (uint64_t &x : h)
++                x = kBasis;
 +            const uint64_t *w = reinterpret_cast<const uint64_t *>(p);
-+            for (size_t i = 0; i < n / 8u; ++i)
-+                h = (h ^ w[i]) * 1099511628211ull;
-+            return h;
++            const size_t words = n / 8u;
++            size_t i = 0;
++            for (; i + 8u <= words; i += 8u)
++                for (size_t l = 0; l < 8u; ++l)
++                    h[l] = (h[l] ^ w[i + l]) * kPrime;
++            for (; i < words; ++i)
++                h[0] = (h[0] ^ w[i]) * kPrime;
++            uint64_t r = kBasis;
++            for (uint64_t x : h)
++                r = (r ^ x) * kPrime;
++            return r;
 +        }
 +    }
 +
@@ -31663,10 +31677,10 @@ index f0ad5070b..4f31ff126 100644
              {
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 new file mode 100644
-index 000000000..5500206f5
+index 000000000..14f9a8340
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-@@ -0,0 +1,1194 @@
+@@ -0,0 +1,1251 @@
 +#include "gs_dump_writer.h"
 +#include "ps2_live_ring.h"
 +
@@ -31755,6 +31769,18 @@ index 000000000..5500206f5
 +            uint32_t screenshot_size;
 +        };
 +#pragma pack(pop)
++
++        // [livebatch] the host, idle-waiting for data, is woken once this many bytes are unread (VSync and ReadFIFO2
++        // wake it at once). PS2X_GSLIVE_WAKE_BYTES=0: wake it for every packet, as before.
++        uint64_t wakeBytes()
++        {
++            static const uint64_t s_bytes = []
++            {
++                const char *v = std::getenv("PS2X_GSLIVE_WAKE_BYTES");
++                return v && v[0] ? std::strtoull(v, nullptr, 10) : 65536ull;
++            }();
++            return s_bytes;
++        }
 +
 +        // Game serial in the dump header; the live host also reads it (PCSX2 GameIndex fixes).
 +        std::string liveSerial()
@@ -31901,12 +31927,15 @@ index 000000000..5500206f5
 +                return hostProcess && WaitForSingleObject(hostProcess, 0) == WAIT_OBJECT_0;
 +            }
 +
-+            // Blocks while the ring is full (the host draws slower than the game produces).
-+            bool write(const uint8_t *src, size_t size)
++            int64_t staged = -1; // [livebatch] end of the bytes copied but not yet published (-1: none)
++
++            // Blocks while the ring is full (the host draws slower than the game produces). publish = false leaves the
++            // bytes staged, so a packet's header and data reach the host with one writePos store ([livebatch]).
++            bool write(const uint8_t *src, size_t size, bool publish = true)
 +            {
 +                while (size != 0u)
 +                {
-+                    const int64_t w = header->writePos;
++                    const int64_t w = staged >= 0 ? staged : header->writePos;
 +                    const int64_t r = header->readPos;
 +                    const uint64_t used = static_cast<uint64_t>(w - r);
 +                    const uint64_t freeBytes = capacity - used;
@@ -31914,6 +31943,7 @@ index 000000000..5500206f5
 +                    {
 +                        if (hostGone())
 +                            return false;
++                        flush();
 +                        SetEvent(dataEvent);
 +                        const uint64_t waitStart = ps2xStatTicks();
 +                        header->producerWaiting = 1u;
@@ -31927,21 +31957,36 @@ index 000000000..5500206f5
 +                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
 +                    const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
 +                    std::memcpy(data + offset, src, chunk);
-+                    MemoryBarrier();
-+                    header->writePos = w + static_cast<int64_t>(chunk);
++                    staged = w + static_cast<int64_t>(chunk);
 +                    src += chunk;
 +                    size -= chunk;
 +                }
++                if (publish)
++                    flush();
 +                return true;
 +            }
 +
++            void flush()
++            {
++                if (staged < 0)
++                    return;
++                MemoryBarrier();
++                header->writePos = staged;
++                staged = -1;
++            }
++
 +            // Called after every packet: a kernel call each time is a measurable part of the game
-+            // thread's frame, so only wake the host when it is actually blocked on the event.
-+            void signal()
++            // thread's frame, so only wake the host when it is actually blocked on the event, and then
++            // ([livebatch]) only once it has wakeBytes() to read, unless forced (VSync, ReadFIFO2).
++            void signal(bool force)
 +            {
 +                MemoryBarrier(); // writePos store before the consumerWaiting load (pairs with the host)
-+                if (!header->consumerFlags || header->consumerWaiting)
-+                    SetEvent(dataEvent);
++                if (header->consumerFlags && !header->consumerWaiting)
++                    return;
++                if (!force && header->consumerFlags &&
++                    static_cast<uint64_t>(header->writePos - header->readPos) < wakeBytes())
++                    return;
++                SetEvent(dataEvent);
 +            }
 +
 +            // ReadFIFO2 replies (readFifoInto): the host copies the data, stores its size, bumps seq
@@ -31998,8 +32043,9 @@ index 000000000..5500206f5
 +
 +            bool hostGone() { return header && header->consumerQuit; }
 +
-+            bool write(const uint8_t *src, size_t size)
++            bool write(const uint8_t *src, size_t size, bool publish = true)
 +            {
++                (void)publish; // every chunk is published: the page reads whole packets only
 +                while (size != 0u)
 +                {
 +                    // Atomics on both indices (see Available() in web/play_gs_host.cpp): the
@@ -32032,7 +32078,8 @@ index 000000000..5500206f5
 +                return true;
 +            }
 +
-+            void signal() {} // the host polls once per browser frame
++            void flush() {}
++            void signal(bool) {} // the host polls once per browser frame
 +        };
 +#elif defined(__APPLE__) || defined(__linux__)
 +        // POSIX version of the live ring above: shm_open mapping, events as shared words
@@ -32136,12 +32183,14 @@ index 000000000..5500206f5
 +                return hostExited;
 +            }
 +
++            int64_t staged = -1; // [livebatch] see the Windows version
++
 +            // Blocks while the ring is full (the host draws slower than the game produces).
-+            bool write(const uint8_t *src, size_t size)
++            bool write(const uint8_t *src, size_t size, bool publish = true)
 +            {
 +                while (size != 0u)
 +                {
-+                    const int64_t w = header->writePos;
++                    const int64_t w = staged >= 0 ? staged : header->writePos;
 +                    const int64_t r = header->readPos;
 +                    const uint64_t used = static_cast<uint64_t>(w - r);
 +                    const uint64_t freeBytes = capacity - used;
@@ -32149,6 +32198,7 @@ index 000000000..5500206f5
 +                    {
 +                        if (hostGone())
 +                            return false;
++                        flush();
 +                        ps2live::eventSet(&events->data);
 +                        const uint64_t waitStart = ps2xStatTicks();
 +                        header->producerWaiting = 1u;
@@ -32162,20 +32212,35 @@ index 000000000..5500206f5
 +                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
 +                    const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
 +                    std::memcpy(data + offset, src, chunk);
-+                    __atomic_thread_fence(__ATOMIC_RELEASE);
-+                    header->writePos = w + static_cast<int64_t>(chunk);
++                    staged = w + static_cast<int64_t>(chunk);
 +                    src += chunk;
 +                    size -= chunk;
 +                }
++                if (publish)
++                    flush();
 +                return true;
 +            }
 +
-+            // See the Windows version: only wake the host when it is blocked on the data event.
-+            void signal()
++            void flush()
++            {
++                if (staged < 0)
++                    return;
++                __atomic_thread_fence(__ATOMIC_RELEASE);
++                header->writePos = staged;
++                staged = -1;
++            }
++
++            // See the Windows version: only wake the host when it is blocked on the data event, and has
++            // wakeBytes() to read unless forced.
++            void signal(bool force)
 +            {
 +                __atomic_thread_fence(__ATOMIC_SEQ_CST); // writePos store before the consumerWaiting load
-+                if (!header->consumerFlags || header->consumerWaiting)
-+                    ps2live::eventSet(&events->data);
++                if (header->consumerFlags && !header->consumerWaiting)
++                    return;
++                if (!force && header->consumerFlags &&
++                    static_cast<uint64_t>(header->writePos - header->readPos) < wakeBytes())
++                    return;
++                ps2live::eventSet(&events->data);
 +            }
 +
 +            // ReadFIFO2 replies (readFifoInto), see the Windows version.
@@ -32226,7 +32291,7 @@ index 000000000..5500206f5
 +                return file != nullptr;
 +            }
 +
-+            void write(const void *data, size_t size)
++            void write(const void *data, size_t size, bool publish = true)
 +            {
 +                if (size == 0)
 +                    return;
@@ -32249,7 +32314,7 @@ index 000000000..5500206f5
 +                }
 +                if (liveActive)
 +                {
-+                    if (!live.write(static_cast<const uint8_t *>(data), size))
++                    if (!live.write(static_cast<const uint8_t *>(data), size, publish))
 +                    {
 +#if defined(_WIN32)
 +                        DWORD exitCode = 0;
@@ -32284,11 +32349,15 @@ index 000000000..5500206f5
 +            void writeByte(uint8_t value) { write(&value, 1); }
 +            void writeWord(uint32_t value) { write(&value, 4); }
 +
-+            void endPacket()
++            // force = false (GS transfers, VIF1 streams): the host is woken only once enough is queued ([livebatch]).
++            void endPacket(bool force = true)
 +            {
 +#if defined(PS2X_GS_LIVE_RING)
 +                if (liveActive && !liveNull)
-+                    live.signal();
++                {
++                    live.flush();
++                    live.signal(force);
++                }
 +#endif
 +            }
 +
@@ -32551,11 +32620,11 @@ index 000000000..5500206f5
 +    {
 +        void writeTransferLocked(Writer &w, int path, const uint8_t *data, uint32_t size)
 +        {
-+            w.writeByte(kTypeTransfer);
-+            w.writeByte(path == 1 ? kPath1New : (path == 2 ? kPath2 : kPath3));
-+            w.writeWord(size);
-+            w.write(data, size);
-+            w.endPacket();
++            uint8_t head[6] = {kTypeTransfer, path == 1 ? kPath1New : (path == 2 ? kPath2 : kPath3)};
++            std::memcpy(head + 2, &size, 4);
++            w.write(head, sizeof(head), false); // [livebatch] header and data published together
++            w.write(data, size, false);
++            w.endPacket(false);
 +        }
 +
 +        // Appends PATH3 data and sends every GIF packet completed so far (see Writer::path3Pending).
@@ -32778,10 +32847,11 @@ index 000000000..5500206f5
 +        std::lock_guard<std::mutex> lock(w.mutex);
 +        if (!w.usable())
 +            return;
-+        w.writeByte(kTypeLiveVif1);
-+        w.writeWord(sizeBytes);
-+        w.write(data, sizeBytes);
-+        w.endPacket();
++        uint8_t head[5] = {kTypeLiveVif1};
++        std::memcpy(head + 1, &sizeBytes, 4);
++        w.write(head, sizeof(head), false); // [livebatch] published with the data by endPacket
++        w.write(data, sizeBytes, false);
++        w.endPacket(false);
 +    }
 +
 +    void vif1(const Span *spans, size_t count)
@@ -32797,16 +32867,17 @@ index 000000000..5500206f5
 +        std::lock_guard<std::mutex> lock(w.mutex);
 +        if (!w.usable())
 +            return;
-+        w.writeByte(kTypeLiveVif1);
-+        w.writeWord(sizeBytes);
++        uint8_t head[5] = {kTypeLiveVif1};
++        std::memcpy(head + 1, &sizeBytes, 4);
++        w.write(head, sizeof(head), false); // [livebatch] published with the data by endPacket
 +        for (size_t i = 0; i < count && sizeBytes != 0u; ++i)
 +        {
 +            const uint32_t take = std::min(spans[i].size, sizeBytes);
 +            if (take != 0u)
-+                w.write(spans[i].data, take);
++                w.write(spans[i].data, take, false);
 +            sizeBytes -= take;
 +        }
-+        w.endPacket();
++        w.endPacket(false);
 +    }
 +
 +    void vif1Register(uint32_t address, uint32_t value)
@@ -32929,6 +33000,42 @@ index 000000000..725c9a5ec
 +    void vif1Register(uint32_t address, uint32_t value);
 +    void vsync(const GSRegisters &regs, int field);
 +}
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 565892816..8ed19a8bc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "gs_dump_writer.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+@@ -725,7 +726,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+             if ((nloop * nreg) & 1)
+                 offset += 8;
+         }
+-        else if (flg == GIF_FMT_IMAGE)
++        else // GIF_FMT_IMAGE, and FLG=3, which the GIF also treats as IMAGE
+         {
+             uint32_t imageBytes = nloop * 16;
+             if (offset + imageBytes > sizeBytes)
+@@ -1572,7 +1573,14 @@ void GS::vertexKick(bool drawing)
+     if (m_vtxCount < needed)
+         return;
+ 
+-    if (drawing && m_backend)
++    // [livelite] When the PCSX2 GS host draws the game the backend drops the batch (GSCpuBackend::Submit), and the
++    // preferred display source only picks what this runtime presents: neither is built. The vertex queue still advances.
++    static const bool s_liveSkipDraw = []
++    {
++        const char *keep = std::getenv("PS2X_GS_KEEP_RASTER");
++        return ps2_gsdump::liveActive() && !(keep && *keep == '1');
++    }();
++    if (drawing && m_backend && !s_liveSkipDraw)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
+         updatePreferredDisplaySourceForDraw(batch);
 diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
 index c289ba0f2..e5ac8dcf1 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
