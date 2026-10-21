@@ -106,14 +106,19 @@ namespace
         data[3] = static_cast<uint8_t>(buttons >> 8);
     }
 
-    void syncVWidescreen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    bool g_widescreen = false;
+
+    void syncVHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t scale = 0;
-        std::memcpy(&scale, rdram + kProjectionScaleX, sizeof(scale));
-        if (scale == kProjectionScaleX4x3)
+        if (g_widescreen)
         {
-            const uint32_t wide = kProjectionScaleX16x9;
-            std::memcpy(rdram + kProjectionScaleX, &wide, sizeof(wide));
+            uint32_t scale = 0;
+            std::memcpy(&scale, rdram + kProjectionScaleX, sizeof(scale));
+            if (scale == kProjectionScaleX4x3)
+            {
+                const uint32_t wide = kProjectionScaleX16x9;
+                std::memcpy(rdram + kProjectionScaleX, &wide, sizeof(wide));
+            }
         }
         g_syncVHandler(rdram, ctx, runtime);
     }
@@ -148,17 +153,19 @@ namespace
         // The game runs its own malloc over the whole SetupHeap range (0x41CF50 to the end of RAM).
         // Without a private runtime region, the runtime's GS packets (sceGsPutDispEnv...) landed on
         // the game's first heap block, a list of handlers walked by 0x0028D990, which then called 0.
-        ps2_game_overrides::setRuntimeHeapReserve(0x00100000u);
+        // 64 KB is plenty (the runtime uses a few hundred bytes there). The heap is tight: with 1 MB
+        // reserved the game ran out loading Alice's second model (chr/ali/0010_ps2.dff, 0x39340)
+        // whenever the CPU picked her, then retried a CD file that does not exist forever.
+        ps2_game_overrides::setRuntimeHeapReserve(0x00010000u);
 
         const std::string widescreen = envValue("PS2X_BR4_WIDESCREEN");
-        if (widescreen.empty() || widescreen[0] != '0')
+        g_widescreen = widescreen.empty() || widescreen[0] != '0';
+        g_syncVHandler = runtime.lookupFunction(kSceGsSyncV);
+        if (g_syncVHandler && g_widescreen)
         {
-            g_syncVHandler = runtime.lookupFunction(kSceGsSyncV);
-            if (g_syncVHandler)
-            {
-                runtime.replaceFunction(kSceGsSyncV, syncVWidescreen);
+            runtime.replaceFunction(kSceGsSyncV, syncVHook);
+            if (g_widescreen)
                 std::cerr << "[Bloody Roar 4] widescreen 16:9 on" << std::endl;
-            }
         }
 
         // SDK functions ps2_analyzer did not name in this stripped ELF; left as guest code they spin

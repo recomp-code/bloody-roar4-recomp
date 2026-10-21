@@ -75,8 +75,10 @@ it off (the launcher's 4:3 option, with the `_4x3` presets).
   FFmpeg again).
 - **Game override:** the game runs its own malloc over the whole `SetupHeap` range (0x41CF50 to the end of RAM).
   Without a private runtime region, the runtime's GS packets (`sceGsPutDispEnv`...) landed on the game's first
-  heap block, a list of handlers walked by 0x0028D990, which then called 0. Now 1 MB is reserved for the
-  runtime (`setRuntimeHeapReserve`). The two unnamed `sceCdSearchFile` copies at 0x2D8730 (`_sceCdSearchFile`,
+  heap block, a list of handlers walked by 0x0028D990, which then called 0. Now 64 KB at the top is reserved
+  for the runtime (`setRuntimeHeapReserve`; it uses a few hundred bytes there). It used to be 1 MB, and that
+  left the game heap too tight: with Alice as the opponent, malloc failed for `chr/ali/0010_ps2.dff`
+  (0x39340 bytes), the loader fell back to the CD path and retried `\CHR\ALI\0010.DFF` forever on LOADING. The two unnamed `sceCdSearchFile` copies at 0x2D8730 (`_sceCdSearchFile`,
   binds 0x80000597 like NBA's 0x004C6E60) and 0x2D8A48 (a 28-byte wrapper) are bound to the runtime's; left as
   guest code they spin forever in "bind RPC until cd->server != 0".
 - **IOP -> EE RPC** (`iop_rpc.cpp`, `RPC.cpp`, `IopHost::findEeRpcServer` / `callEeRpcServer`): Hudson's SSM
