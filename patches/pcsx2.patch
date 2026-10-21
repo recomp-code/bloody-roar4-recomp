@@ -9290,6 +9290,30 @@ index 6b6fde5d5..3e4d71224 100644
  			if (!CanDoPath1())
  			{
  				stat.P1Q = 1;
+diff --git a/pcsx2/ImGui/ImGuiManager.cpp b/pcsx2/ImGui/ImGuiManager.cpp
+index 6bf97103c..767b7015b 100644
+--- a/pcsx2/ImGui/ImGuiManager.cpp
++++ b/pcsx2/ImGui/ImGuiManager.cpp
+@@ -10,6 +10,7 @@
+ #include "ImGui/FullscreenUI.h"
+ #include "ImGui/ImGuiFullscreen.h"
+ #include "ImGui/ImGuiManager.h"
++#include "GSDumpReplayer.h"
+ #include "ImGui/ImGuiOverlays.h"
+ #include "Input/InputManager.h"
+ #include "MTGS.h"
+@@ -1066,7 +1067,10 @@ void ImGuiManager::RenderOSD()
+ 		if (VMManager::HasValidVM())
+ 			RenderOverlays();
+ 
+-		DrawOSDMessages(current_time);
++		// PS2Recomp live mode: PCSX2's own notices (graphics API, patches.zip, controller bindings) are about PCSX2's
++		// settings, not the recompiled game's; the game window shows only the game, its online banner and our menu.
++		if (!GSDumpReplayer::IsLive())
++			DrawOSDMessages(current_time);
+ 	}
+ 
+ 	// Cursors are always last.
 diff --git a/pcsx2/MTGS.cpp b/pcsx2/MTGS.cpp
 index 98b453cf7..c2e9946dd 100644
 --- a/pcsx2/MTGS.cpp
