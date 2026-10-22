@@ -28,6 +28,8 @@
 #include <iostream>
 #include <string>
 
+void ps2xAddEeIdleLoop(uint32_t begin, uint32_t end); // EeScheduler.cpp
+
 namespace
 {
     constexpr uint32_t kScePadRead = 0x002DA7D0u;
@@ -44,6 +46,12 @@ namespace
 
     PS2Runtime::RecompiledFunction g_padReadHandler = nullptr;
     PS2Runtime::RecompiledFunction g_syncVHandler = nullptr;
+
+    // The game's wait at 0x0029E6C0-0x0029E6FC: "while (*(gp-0x6ff8) != *(gp-0x6ff4) || *(u8 *)(gp-0x7000)) call
+    // *(gp-0x72e0) if set", a queue that interrupt handlers drain. Only loads: in the deterministic (online) mode emulated
+    // time goes on to the next event there instead of spinning through the dispatcher (3/4 of the game thread, ~45 fps).
+    constexpr uint32_t kWaitLoopBegin = 0x0029E6C0u;
+    constexpr uint32_t kWaitLoopEnd = 0x0029E700u;
 
     // Environment variable or "" (MSVC: _dupenv_s, getenv is deprecated there).
     std::string envValue(const char *name)
@@ -157,6 +165,7 @@ namespace
         // reserved the game ran out loading Alice's second model (chr/ali/0010_ps2.dff, 0x39340)
         // whenever the CPU picked her, then retried a CD file that does not exist forever.
         ps2_game_overrides::setRuntimeHeapReserve(0x00010000u);
+        ps2xAddEeIdleLoop(kWaitLoopBegin, kWaitLoopEnd);
 
         const std::string widescreen = envValue("PS2X_BR4_WIDESCREEN");
         g_widescreen = widescreen.empty() || widescreen[0] != '0';

@@ -20567,10 +20567,10 @@ index 000000000..9f6604091
 +#endif
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/Dma.cpp b/ps2xIOP/src/emulator/spu2/SPU2/Dma.cpp
 new file mode 100644
-index 000000000..0027a59fe
+index 000000000..39c6602bd
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/Dma.cpp
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,514 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -20709,6 +20709,12 @@ index 000000000..0027a59fe
 +
 +			if (DMAPtr != nullptr)
 +				memcpy(GetMemPtr(0x2000 + (Index << 10) + spos), DMAPtr + InputDataProgress, 0x200);
++			{ // ps2recomp: PS2X_ADMA_DUMP=<file>: core 0's AutoDMA input as it arrives (raw, 512-byte L/R blocks), to
++			  // compare with a movie's PCM (how Bloody Roar 4's lost movie audio packets were found)
++				static FILE* s_dump = [] { const char* p = std::getenv("PS2X_ADMA_DUMP"); return p && *p ? std::fopen(p, "wb") : nullptr; }();
++				if (s_dump && Index == 0 && DMAPtr != nullptr)
++					std::fwrite(DMAPtr + InputDataProgress, 1, 0x200, s_dump);
++			}
 +			InputDataTransferred += 0x200;
 +			InputDataLeft -= 0x100;
 +			InputDataProgress += 0x100;
@@ -27102,7 +27108,7 @@ index 0f19c9f24..f3d7a6a65 100644
      do                                     \
      {                                      \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff998..ebcf7a1ff 100644
+index f247ff998..7a3cff9bb 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -236,6 +236,8 @@ enum class EeEventType : uint8_t
@@ -27181,7 +27187,12 @@ index f247ff998..ebcf7a1ff 100644
      std::unordered_map<int, EeIrqHandler> m_intcHandlers;
      std::unordered_map<int, EeIrqHandler> m_dmacHandlers;
      int m_nextThreadId = kFirstThreadId;
-@@ -426,6 +466,10 @@ private:
+@@ -422,10 +462,15 @@ private:
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
++    bool m_yieldServesInvocation = false; // a thread just yielded (RotateThreadReadyQueue): run a pending callback first
+     bool m_timeSliceExpired = false;
      bool m_insideInterrupt = false;
      uint32_t m_pendingEeTimerInterrupts = 0;
      uint64_t m_eeCycle = 0;
@@ -27192,7 +27203,7 @@ index f247ff998..ebcf7a1ff 100644
      uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
      std::thread::id m_executorThread{};
      std::atomic<bool> m_running{false};
-@@ -436,6 +480,8 @@ private:
+@@ -436,6 +481,8 @@ private:
  
      mutable std::mutex m_eventMutex;
      std::condition_variable m_eventCv;
@@ -27201,7 +27212,7 @@ index f247ff998..ebcf7a1ff 100644
      std::deque<EeEvent> m_events;
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
-@@ -449,6 +495,11 @@ private:
+@@ -449,6 +496,11 @@ private:
      uint32_t m_gsVSyncCallbackSp = 0;
      std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
      std::atomic<uint64_t> m_nextDeadlineCycle{0};
@@ -27301,10 +27312,10 @@ index ea86a9cb2..31c69722e 100644
      std::vector<PendingTransfer> m_pendingGifTransfers;
      std::vector<PendingTransfer> m_pendingVif0Transfers;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c48d..db377415c 100644
+index c5e31c48d..76cc759ec 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1,16 +1,146 @@
+@@ -1,16 +1,159 @@
  #include "runtime/ee_scheduler.h"
 +#include <atomic>
 +// ps2_crash_handler.cpp: pc field of the guest thread being executed, for PS2X_PROFILE's guest pc samples.
@@ -27350,6 +27361,19 @@ index c5e31c48d..db377415c 100644
 +    // [det] What one RotateThreadReadyQueue costs in emulated time: threads that only yield to each other (the movie
 +    // loop) then reach the next event by their own work. ~14 us.
 +    constexpr uint32_t kDetYieldCycles = 4096u;
++
++    // [det] The longest step emulated time takes at once in a wait (an idle yield, a registered wait loop): 1 ms, so
++    // interrupts and the threads they wake (the sound streamer) still run between steps. PS2X_DET_IDLE_STEP_US=0: no
++    // steps (a yield costs kDetYieldCycles, wait loops just run).
++    uint64_t detIdleStep()
++    {
++        static const uint64_t s_step = []
++        {
++            const char *env = std::getenv("PS2X_DET_IDLE_STEP_US");
++            return (env && *env ? std::strtoull(env, nullptr, 10) : 1000ull) * 294912ull / 1000ull;
++        }();
++        return s_step;
++    }
 +
 +    // [det] PS2X_DETHASH=N: a hash of all of EE RAM every N vblanks, and the EE cycle it happened at -- the test that
 +    // two runs (or two machines online) are the same game: "[dethash] vsync V cycle C h=H". PS2X_DETDUMP=V adds one hash
@@ -27451,7 +27475,7 @@ index c5e31c48d..db377415c 100644
      constexpr int KE_OK = 0;
      constexpr int KE_ERROR = -1;
      constexpr int KE_ILLEGAL_PRIORITY = -403;
-@@ -87,14 +217,20 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+@@ -87,14 +230,20 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
      m_executorThread = std::this_thread::get_id();
      m_rdram = rdram;
      m_readyQueues = {};
@@ -27473,7 +27497,7 @@ index c5e31c48d..db377415c 100644
      m_nextSemaphoreId = 1;
      m_nextEventFlagId = 1;
      m_nextAlarmId = 1;
-@@ -112,6 +248,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+@@ -112,6 +261,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
      m_insideInterrupt = false;
      m_pendingEeTimerInterrupts = 0u;
      m_eeCycle = 0u;
@@ -27484,7 +27508,24 @@ index c5e31c48d..db377415c 100644
      m_sliceEndCycle = kDefaultTimeSliceCycles;
      m_stopRequested.store(false, std::memory_order_release);
      m_checkpointPending.store(false, std::memory_order_release);
-@@ -215,6 +355,7 @@ void EeScheduler::run()
+@@ -167,7 +320,15 @@ void EeScheduler::run()
+ 
+         if (m_currentThreadId == 0)
+         {
+-            GuestThread *next = selectReady();
++            // A callback tagged with its caller waits for a moment when no thread is ready (see below), but threads
++            // that wait by yielding to each other are always ready: Bloody Roar 4's waited for its RPC callbacks
++            // (0x21c660) for seconds, spinning through the scheduler. On a PS2 the callback comes as an interrupt,
++            // whatever is ready; a yield is a safe point to run it (the yielding thread is inside a syscall).
++            // PS2X_YIELD_CALLBACKS=0: the old order.
++            static const bool s_yieldCallbacks = [] { const char *e = std::getenv("PS2X_YIELD_CALLBACKS"); return !(e && *e == '0'); }();
++            const bool serveInvocation = s_yieldCallbacks && m_yieldServesInvocation && !m_pendingInvocations.empty();
++            m_yieldServesInvocation = false;
++            GuestThread *next = serveInvocation ? nullptr : selectReady();
+             if (!next && m_pendingInvocations.empty())
+             {
+                 copyMainContextToRuntime();
+@@ -215,6 +376,7 @@ void EeScheduler::run()
              }
          }
          R5900Context &context = running->activeContext();
@@ -27492,7 +27533,7 @@ index c5e31c48d..db377415c 100644
          if (m_debugPublishCountdown == 0u)
          {
              copyMainContextToRuntime();
-@@ -256,17 +397,39 @@ void EeScheduler::run()
+@@ -256,17 +418,39 @@ void EeScheduler::run()
  
          if (!m_pendingInvocations.empty() && running->invocations.empty())
          {
@@ -27539,7 +27580,7 @@ index c5e31c48d..db377415c 100644
          {
              if (!running->invocations.empty())
              {
-@@ -280,23 +443,84 @@ void EeScheduler::run()
+@@ -280,23 +464,84 @@ void EeScheduler::run()
                                                  context.pc,
                                                  PS2Runtime::GuestBranchKind::DirectJump,
                                                  "EE scheduler");
@@ -27625,7 +27666,7 @@ index c5e31c48d..db377415c 100644
              m_guestExecuting.store(false, std::memory_order_release);
              m_insideInterrupt = false;
          }
-@@ -334,10 +558,22 @@ void EeScheduler::run()
+@@ -334,10 +579,22 @@ void EeScheduler::run()
  void EeScheduler::requestStop()
  {
      m_stopRequested.store(true, std::memory_order_release);
@@ -27649,7 +27690,7 @@ index c5e31c48d..db377415c 100644
  void EeScheduler::postEvent(EeEvent event)
  {
      if (event.type == EeEventType::Stop)
-@@ -349,14 +585,111 @@ void EeScheduler::postEvent(EeEvent event)
+@@ -349,14 +606,111 @@ void EeScheduler::postEvent(EeEvent event)
      {
          std::lock_guard lock(m_eventMutex);
          m_events.push_back(event);
@@ -27762,7 +27803,7 @@ index c5e31c48d..db377415c 100644
  
      if (m_checkpointPending.load(std::memory_order_acquire) ||
          m_stopRequested.load(std::memory_order_acquire))
-@@ -367,7 +700,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -367,15 +721,129 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
      const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
      if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
      {
@@ -27771,24 +27812,37 @@ index c5e31c48d..db377415c 100644
          return true;
      }
  
-@@ -376,6 +709,108 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
++    // [det] A registered wait loop goes on to the next timed event (in cycle order: only emulated state decides), at
++    // most detIdleStep() at a time so interrupts and the threads they wake (the sound streamer) run between steps, and
++    // whatever the host's clock says (the pacing in processDueDeadlines then waits for its wall-clock time). Checked at
++    // every dispatch, not only at slice ends: Bloody Roar 4's loop at 0x29e6c0 spent 3/4 of the game thread spinning
++    // through the dispatcher. Any other code just runs: no catch-up by the clock, no sleeping that turns host time into
++    // cycles.
++    if (eeDeterministic() && !g_eeIdleLoops.empty() && detIdleStep() != 0u)
++    {
++        const uint64_t nextEvent = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        const GuestThread *running = currentThread();
++        // (only with nothing else to run: what the loop waits for may be a thread of its own priority, which gets the
++        // CPU at the slice end below)
++        if (running != nullptr && nextEvent > m_eeCycle && eeIdleLoopAt(running->activeContext().pc) &&
++            !hasReadyAtOrAbovePriority(running->currentPriority) && m_pendingInvocations.empty())
++        {
++            accountCycles(static_cast<uint32_t>(std::min<uint64_t>(nextEvent - m_eeCycle, detIdleStep())));
++            if (m_eeCycle >= nextEvent)
++                markCheckpointPending();
++            // the loop's code runs again (it re-reads what it waits for) unless something is due now
++            return m_checkpointPending.load(std::memory_order_acquire) || m_pendingEeTimerInterrupts != 0u;
++        }
++    }
++
+     if (m_eeCycle < m_sliceEndCycle)
+     {
          return false;
      }
  
-+    // [det] A registered wait loop goes straight to the next timed event, whatever the host's clock says (the pacing
-+    // in processDueDeadlines then waits for its wall-clock time). Any other code just runs: no catch-up by the clock,
-+    // no sleeping that turns host time into cycles.
 +    if (eeDeterministic())
 +    {
-+        const int64_t hostDeadline = m_nextHostDeadlineRep.load(std::memory_order_acquire);
-+        const uint64_t targetCycle = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
 +        const GuestThread *running = currentThread();
-+        if (running != nullptr && hostDeadline != INT64_MAX && targetCycle > m_eeCycle && eeIdleLoopAt(running->activeContext().pc))
-+        {
-+            accountCycles(static_cast<uint32_t>(std::min<uint64_t>(targetCycle - m_eeCycle, 0xFFFFFFFFull)));
-+            markCheckpointPending();
-+            return true;
-+        }
 +        if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
 +        {
 +            m_rescheduleRequested = true;
@@ -27880,7 +27934,7 @@ index c5e31c48d..db377415c 100644
      const GuestThread *running = currentThread();
      if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
      {
-@@ -384,19 +819,126 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -384,19 +852,126 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -28009,7 +28063,7 @@ index c5e31c48d..db377415c 100644
      }
  }
  
-@@ -471,6 +1013,7 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
+@@ -471,6 +1046,7 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
      {
          ownedStack = it->second.stack;
      }
@@ -28017,7 +28071,7 @@ index c5e31c48d..db377415c 100644
      m_threads.erase(it);
      publishSnapshot();
      return KE_OK;
-@@ -519,6 +1062,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+@@ -519,6 +1095,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
      m_currentThreadId = 0;
      if (deleteThreadRecord && id != kMainThreadId)
      {
@@ -28025,7 +28079,24 @@ index c5e31c48d..db377415c 100644
          m_threads.erase(id);
      }
      if (ownedStack != 0u)
-@@ -772,6 +1316,32 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+@@ -755,11 +1332,16 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+     }
+ 
+     GuestThread *self = currentThread();
++    // [det] an idle yield: the caller would run again at once (nothing else ready at its priority or above)
++    const bool idleYield = self && self->currentPriority == priority && !hasReadyAtOrAbovePriority(priority) &&
++                           m_pendingInvocations.empty() && m_pendingEeTimerInterrupts == 0u &&
++                           !m_checkpointPending.load(std::memory_order_acquire);
+     if (self && self->currentPriority == priority)
+     {
+         enqueueReady(*self);
+         m_currentThreadId = 0;
+         m_rescheduleRequested = true;
++        m_yieldServesInvocation = !m_pendingInvocations.empty();
+     }
+     else
+     {
+@@ -772,6 +1354,40 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
          }
      }
      (void)interruptSafe;
@@ -28043,8 +28114,16 @@ index c5e31c48d..db377415c 100644
 +    const uint64_t targetCycle = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
 +    if (eeDeterministic())
 +    {
-+        // [det] a fixed price per yield instead of "however late the clock says we are"
-+        accountCycles(kDetYieldCycles);
++        // [det] a fixed price per yield instead of "however late the clock says we are". An idle yield (Bloody Roar 4's
++        // idle thread, between the end of a frame's work and the vblank) goes on to the next timed event, at most
++        // detIdleStep() at a time, so interrupts and the threads they wake (the sound streamer) still run between steps,
++        // instead of thousands of trips through the scheduler a frame. Only emulated state decides the step: the same on
++        // both machines.
++        uint64_t charge = kDetYieldCycles;
++        const uint64_t nextEvent = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        if (idleYield && detIdleStep() != 0u && nextEvent > m_eeCycle + kDetYieldCycles)
++            charge = std::min<uint64_t>(nextEvent - m_eeCycle, detIdleStep());
++        accountCycles(static_cast<uint32_t>(charge));
 +        if (m_nextDeadlineCycle.load(std::memory_order_acquire) != 0u && m_eeCycle >= m_nextDeadlineCycle.load(std::memory_order_acquire))
 +            markCheckpointPending();
 +    }
@@ -28058,7 +28137,7 @@ index c5e31c48d..db377415c 100644
      publishSnapshot();
      return KE_OK;
  }
-@@ -863,9 +1433,43 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
+@@ -863,9 +1479,43 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
      return id;
  }
  
@@ -28102,7 +28181,7 @@ index c5e31c48d..db377415c 100644
      EeSemaphore *object = semaphore(id);
      if (!object)
      {
-@@ -910,11 +1514,28 @@ int EeScheduler::pollSemaphore(int id)
+@@ -910,11 +1560,28 @@ int EeScheduler::pollSemaphore(int id)
  void EeScheduler::waitSemaphore(int id)
  {
      assertExecutor();
@@ -28131,7 +28210,7 @@ index c5e31c48d..db377415c 100644
          setReturnS32(&self->activeContext(), KE_UNKNOWN_SEMID);
          return;
      }
-@@ -923,6 +1544,16 @@ void EeScheduler::waitSemaphore(int id)
+@@ -923,6 +1590,16 @@ void EeScheduler::waitSemaphore(int id)
          --object->count;
          GuestThread *self = currentThread();
          assert(self != nullptr);
@@ -28148,7 +28227,7 @@ index c5e31c48d..db377415c 100644
          setReturnS32(&self->activeContext(), id);
          publishSnapshot();
          return;
-@@ -1103,7 +1734,19 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+@@ -1103,7 +1780,19 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
      assertExecutor();
      invocation.sequence = ++m_invocationSequence;
      m_pendingInvocations.push_back(std::move(invocation));
@@ -28169,7 +28248,7 @@ index c5e31c48d..db377415c 100644
  }
  
  [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
-@@ -1256,11 +1899,37 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1256,11 +1945,37 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
  {
      assertExecutor();
      const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
@@ -28208,7 +28287,7 @@ index c5e31c48d..db377415c 100644
      std::vector<EeIrqHandler> matching;
      for (const auto &[id, handler] : handlers)
      {
-@@ -1392,10 +2061,37 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
+@@ -1392,10 +2107,37 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
      blockCurrent(std::move(wait));
  }
  
@@ -28247,7 +28326,7 @@ index c5e31c48d..db377415c 100644
  }
  
  const GuestThread *EeScheduler::thread(int id) const
-@@ -1440,6 +2136,15 @@ const GuestThread *EeScheduler::currentThread() const
+@@ -1440,6 +2182,15 @@ const GuestThread *EeScheduler::currentThread() const
  
  int EeScheduler::currentThreadId() const noexcept
  {
@@ -28263,7 +28342,7 @@ index c5e31c48d..db377415c 100644
      return m_currentThreadId;
  }
  
-@@ -1633,6 +2338,40 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1633,6 +2384,40 @@ void EeScheduler::makeRunning(GuestThread &item)
  {
      assert(m_currentThreadId == 0);
      assert(item.status == EeThreadStatus::Ready);
@@ -28304,7 +28383,7 @@ index c5e31c48d..db377415c 100644
      item.status = EeThreadStatus::Running;
      m_currentThreadId = item.id;
      renewTimeSlice();
-@@ -1716,7 +2455,7 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
+@@ -1716,7 +2501,7 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
      m_rescheduleRequested = true;
      if (interruptSafe || m_insideInterrupt)
      {
@@ -28313,7 +28392,7 @@ index c5e31c48d..db377415c 100644
      }
  }
  
-@@ -1743,6 +2482,20 @@ void EeScheduler::applyPendingPreemption()
+@@ -1743,6 +2528,20 @@ void EeScheduler::applyPendingPreemption()
  void EeScheduler::processPendingEvents()
  {
      assertExecutor();
@@ -28334,7 +28413,7 @@ index c5e31c48d..db377415c 100644
      processDueDeadlines();
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
-@@ -1800,6 +2553,12 @@ void EeScheduler::processDueDeadlines()
+@@ -1800,6 +2599,12 @@ void EeScheduler::processDueDeadlines()
  
              if (now < pacingDeadline)
              {
@@ -28347,7 +28426,7 @@ index c5e31c48d..db377415c 100644
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                       { return !m_events.empty() ||
                                                m_stopRequested.load(std::memory_order_acquire); });
-@@ -1810,11 +2569,14 @@ void EeScheduler::processDueDeadlines()
+@@ -1810,11 +2615,14 @@ void EeScheduler::processDueDeadlines()
                  }
              }
  
@@ -28364,7 +28443,7 @@ index c5e31c48d..db377415c 100644
              due.insert(due.end(),
                         std::make_move_iterator(m_deadlines.begin()),
                         std::make_move_iterator(firstFuture));
-@@ -1847,11 +2609,17 @@ void EeScheduler::processDueDeadlines()
+@@ -1847,11 +2655,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -28384,7 +28463,7 @@ index c5e31c48d..db377415c 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -1868,7 +2636,14 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1868,7 +2682,14 @@ void EeScheduler::processEvent(const EeEvent &event)
          break;
      case EeEventType::VBlankStart:
          ++m_vsyncTick;
@@ -28399,7 +28478,7 @@ index c5e31c48d..db377415c 100644
          if ((m_vsyncTick & 1u) != 0u)
          {
              m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
-@@ -1931,6 +2706,34 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1931,6 +2752,34 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -28434,7 +28513,7 @@ index c5e31c48d..db377415c 100644
      }
  }
  
-@@ -2029,16 +2832,25 @@ void EeScheduler::waitForEvent()
+@@ -2029,16 +2878,25 @@ void EeScheduler::waitForEvent()
      if (hasTimerDeadline)
      {
          const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
@@ -28461,7 +28540,7 @@ index c5e31c48d..db377415c 100644
      if (!signaled)
      {
          const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
-@@ -2050,7 +2862,7 @@ void EeScheduler::waitForEvent()
+@@ -2050,7 +2908,7 @@ void EeScheduler::waitForEvent()
              accountCycles(step);
              remaining -= step;
          }
@@ -28470,7 +28549,7 @@ index c5e31c48d..db377415c 100644
      }
  }
  
-@@ -2068,11 +2880,26 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
+@@ -2068,11 +2926,26 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
  
  void EeScheduler::updateNextDeadline()
  {
@@ -28497,7 +28576,7 @@ index c5e31c48d..db377415c 100644
      const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
                                       [](const ScheduledEvent &left, const ScheduledEvent &right)
                                       {
-@@ -2100,6 +2927,9 @@ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
+@@ -2100,6 +2973,9 @@ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
  
  void EeScheduler::renewTimeSlice()
  {
@@ -29886,7 +29965,7 @@ index b1bb6d851..dd9848304 100644
      }
  
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index 44eaef4d9..a5c6420ce 100644
+index 44eaef4d9..9b80b1d09 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 @@ -483,6 +483,21 @@ namespace ps2_stubs
@@ -30054,7 +30133,7 @@ index 44eaef4d9..a5c6420ce 100644
          }
  
          void recordCdStreamBytesDemuxedUnlocked(
-@@ -1620,6 +1711,104 @@ namespace ps2_stubs
+@@ -1620,6 +1711,185 @@ namespace ps2_stubs
              runtime->eeScheduler().queueInvocation(std::move(invocation));
          }
  
@@ -30156,10 +30235,119 @@ index 44eaef4d9..a5c6420ce 100644
 +            return true;
 +        }
 +
++        // [audiofifo] A movie's audio packets go to the game's callback one at a time, and a packet the callback refuses
++        // (returns 0: its sound buffer is full) is offered again later, as libmpeg does (it stops demuxing there). The
++        // callbacks used to be fired for every packet at once with the answer ignored: Bloody Roar 4's copies a packet
++        // whole or not at all, so packets were lost whenever its buffer was full, and as each holds an odd number of bytes
++        // (4073) the 16-bit PCM after them was off by one byte -- loud noise over the Hudson logo and the opening movie,
++        // which then looped on in the SPU2's input. As libmpeg does, the demux does not tell the game the bytes are consumed
++        // until their audio is taken (sceMpegDemuxPssRing returns 0 meanwhile and the game offers the same bytes again), so
++        // the packets stay valid in the game's ring and the video waits for the sound as on a PS2.
++        // PS2X_MPEG_AUDIO_FIFO=0: the old way.
++        struct MpegAudioFifo
++        {
++            std::deque<MpegStreamCallbackEvent> packets;
++            bool inFlight = false;
++            // the demuxed bytes not reported consumed yet (the game offers them again at holdAddr)
++            bool holding = false;
++            uint32_t holdAddr = 0u, holdLen = 0u;
++        };
++        std::unordered_map<uint32_t, MpegAudioFifo> g_mpegAudioFifos; // under g_mpeg_stub_mutex
++        bool g_ringDemuxDispatch = false; // the callbacks being dispatched come from sceMpegDemuxPssRing (it holds bytes back)
++
++        bool mpegAudioFifoEnabled()
++        {
++            static const bool s_on = [] { const char *e = std::getenv("PS2X_MPEG_AUDIO_FIFO"); return !(e && *e == '0'); }();
++            return s_on;
++        }
++
++        void pumpMpegAudioFifo(uint8_t *rdram, const R5900Context &callerCtx, PS2Runtime *runtime, uint32_t mpegAddr)
++        {
++            MpegStreamCallbackEvent event{};
++            {
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                const auto it = g_mpegAudioFifos.find(mpegAddr);
++                if (it == g_mpegAudioFifos.end() || it->second.inFlight || it->second.packets.empty())
++                    return;
++                event = it->second.packets.front();
++                it->second.inFlight = true;
++            }
++            const MpegRegisteredCallback callback = event.callbacks.front();
++            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++            if (cbDataAddr == 0u || !writeMpegCallbackData(rdram, cbDataAddr, event))
++            {
++                if (cbDataAddr)
++                    runtime->guestFree(cbDataAddr);
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                g_mpegAudioFifos[mpegAddr].inFlight = false; // tried again at the next demux
++                return;
++            }
++
++            R5900Context callbackCtx = callerCtx;
++            SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
++            SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
++            SET_GPR_U32(&callbackCtx, 6, callback.data);
++            SET_GPR_U32(&callbackCtx, 7, 0u);
++            SET_GPR_U32(&callbackCtx, 29, 0u);
++            SET_GPR_U32(&callbackCtx, 31, 0u);
++            callbackCtx.pc = callback.func;
++
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::RpcCallback;
++            invocation.context = callbackCtx;
++            invocation.onComplete = [rdram, runtime, cbDataAddr, mpegAddr, callerCtx](const R5900Context &done, R5900Context &)
++            {
++                runtime->guestFree(cbDataAddr);
++                const bool accepted = getRegU32(const_cast<R5900Context *>(&done), 2) != 0u;
++                bool more = false;
++                {
++                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                    const auto it = g_mpegAudioFifos.find(mpegAddr);
++                    if (it == g_mpegAudioFifos.end())
++                        return; // the movie was deleted meanwhile
++                    it->second.inFlight = false;
++                    if (accepted && !it->second.packets.empty())
++                        it->second.packets.pop_front();
++                    more = accepted && !it->second.packets.empty();
++                }
++                if (more)
++                    pumpMpegAudioFifo(rdram, callerCtx, runtime, mpegAddr);
++            };
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        }
++
          void dispatchStreamCallbacks(uint8_t *rdram,
                                       R5900Context *ctx,
                                       PS2Runtime *runtime,
-@@ -1885,6 +2074,37 @@ namespace ps2_stubs
+@@ -1630,13 +1900,27 @@ namespace ps2_stubs
+                 return;
+             }
+ 
++            std::vector<uint32_t> audioMpegs;
+             for (const MpegStreamCallbackEvent &event : events)
+             {
++                if (mpegAudioFifoEnabled() && g_ringDemuxDispatch && (event.streamType == kMpegStrPCM || event.streamType == kMpegStrADPCM) &&
++                    event.callbacks.size() == 1u)
++                {
++                    {
++                        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                        g_mpegAudioFifos[event.mpegAddr].packets.push_back(event);
++                    }
++                    if (std::find(audioMpegs.begin(), audioMpegs.end(), event.mpegAddr) == audioMpegs.end())
++                        audioMpegs.push_back(event.mpegAddr);
++                    continue;
++                }
+                 for (const MpegRegisteredCallback &callback : event.callbacks)
+                 {
+                     dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
+                 }
+             }
++            for (const uint32_t mpegAddr : audioMpegs)
++                pumpMpegAudioFifo(rdram, *ctx, runtime, mpegAddr);
+         }
+ 
+         void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
+@@ -1885,6 +2169,37 @@ namespace ps2_stubs
              std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
              MpegPlaybackState &playback = getPlaybackState(mpegAddr);
              const size_t framesBefore = playback.decodedFrames.size();
@@ -30197,7 +30385,7 @@ index 44eaef4d9..a5c6420ce 100644
              while (copied < byteCount)
              {
                  const uint32_t curAddr = dataAddr + static_cast<uint32_t>(copied);
-@@ -1898,6 +2118,14 @@ namespace ps2_stubs
+@@ -1898,6 +2213,14 @@ namespace ps2_stubs
                  feedElementaryStream(playback, src, chunk);
                  copied += chunk;
              }
@@ -30212,7 +30400,7 @@ index 44eaef4d9..a5c6420ce 100644
              wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
          }
  
-@@ -2045,14 +2273,24 @@ namespace ps2_stubs
+@@ -2045,14 +2368,24 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, uVar3 + 0x80, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, uVar3 + 0x94, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, uVar3 + 0x98, 0xFFFFFFFFu);
@@ -30243,7 +30431,44 @@ index 44eaef4d9..a5c6420ce 100644
  
          uint32_t setDynamicRet = a1_init;
          if (uint8_t *p = getMemPtr(rdram, puVar4 + 8))
-@@ -2191,6 +2429,10 @@ namespace ps2_stubs
+@@ -2071,6 +2404,7 @@ namespace ps2_stubs
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
+             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
++            g_mpegAudioFifos.erase(mpegAddr);
+         }
+         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
+         setReturnU32(ctx, 0u);
+@@ -2165,6 +2499,28 @@ namespace ps2_stubs
+         const uint32_t ringBaseAddr = getRegU32(ctx, 7);
+         const uint32_t ringSize = readAbiArg4(rdram, ctx);
+ 
++        // [audiofifo] offer a refused packet again; the bytes held back are consumed once all their audio is taken
++        pumpMpegAudioFifo(rdram, *ctx, runtime, mpegAddr);
++        if (mpegAudioFifoEnabled())
++        {
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            const auto it = g_mpegAudioFifos.find(mpegAddr);
++            if (it != g_mpegAudioFifos.end() && it->second.holding)
++            {
++                MpegAudioFifo &fifo = it->second;
++                if (!fifo.packets.empty() || fifo.inFlight)
++                {
++                    setReturnS32(ctx, 0);
++                    return;
++                }
++                fifo.holding = false;
++                if (fifo.holdAddr == dataAddr)
++                {
++                    setReturnS32(ctx, static_cast<int32_t>(fifo.holdLen));
++                    return;
++                }
++            }
++        }
+         std::vector<MpegStreamCallbackEvent> callbackEvents;
+         std::vector<uint32_t> completedMpegIds;
+         size_t consumed = 0u;
+@@ -2191,6 +2547,10 @@ namespace ps2_stubs
                      callbackEvents);
                  recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
              }
@@ -30254,7 +30479,32 @@ index 44eaef4d9..a5c6420ce 100644
              decodedCount = playback.decodedFrames.size();
              traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
          }
-@@ -2292,11 +2534,17 @@ namespace ps2_stubs
+@@ -2235,8 +2595,23 @@ namespace ps2_stubs
+             });
+         }
+ 
++        g_ringDemuxDispatch = true;
+         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+-        setReturnS32(ctx, static_cast<int32_t>(consumed));
++        g_ringDemuxDispatch = false;
++        int32_t reported = static_cast<int32_t>(consumed);
++        if (mpegAudioFifoEnabled() && consumed != 0u)
++        {   // [audiofifo] audio of these bytes still to be taken: hold them (the game offers them again)
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            const auto it = g_mpegAudioFifos.find(mpegAddr);
++            if (it != g_mpegAudioFifos.end() && (!it->second.packets.empty() || it->second.inFlight))
++            {
++                it->second.holding = true;
++                it->second.holdAddr = dataAddr;
++                it->second.holdLen = static_cast<uint32_t>(consumed);
++                reported = 0;
++            }
++        }
++        setReturnS32(ctx, reported);
+     }
+ 
+     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -2292,11 +2667,17 @@ namespace ps2_stubs
          {
              std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
              MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -30272,7 +30522,7 @@ index 44eaef4d9..a5c6420ce 100644
                  if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                  {
                      PS2_IF_AGRESSIVE_LOGS({
-@@ -2308,6 +2556,7 @@ namespace ps2_stubs
+@@ -2308,6 +2689,7 @@ namespace ps2_stubs
                      ++g_mpeg_stub_state.getPictureWaitTraceCount;
                  }
                  lock.unlock();
@@ -30280,7 +30530,7 @@ index 44eaef4d9..a5c6420ce 100644
                  runtime->eeScheduler().waitExternal(
                      EeWaitReason::Mpeg,
                      kMpegPictureWaitType,
-@@ -2392,6 +2641,37 @@ namespace ps2_stubs
+@@ -2392,6 +2774,37 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
          mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
          mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
@@ -30318,7 +30568,15 @@ index 44eaef4d9..a5c6420ce 100644
  
          if (uint8_t *base = getMemPtr(rdram, mpegAddr))
          {
-@@ -2532,7 +2812,9 @@ namespace ps2_stubs
+@@ -2507,6 +2920,7 @@ namespace ps2_stubs
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(param_1);
+             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
++            g_mpegAudioFifos.erase(param_1); // [audiofifo] the old stream's sound goes too
+             if (playback.streamEnded || playback.decoderFailed)
+             {
+                 resetState.sawInput = true;
+@@ -2532,7 +2946,9 @@ namespace ps2_stubs
          mpegGuestWrite32(rdram, param_1 + 0x08, 0u);
          mpegGuestWrite32(rdram, inner + 0x80, 0xFFFFFFFFu);
          mpegGuestWrite32(rdram, inner + 0xAC, 0u);
@@ -35855,7 +36113,7 @@ index 37b6a4dec..2b1914aeb 100644
      static constexpr uint32_t D_STAT = 0x1000E010u;
      static constexpr uint32_t D_CTRL = 0x1000E000u;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d267..5c8b04867 100644
+index 45cb9d267..60545d6bd 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,9 +1,15 @@
@@ -35897,7 +36155,7 @@ index 45cb9d267..5c8b04867 100644
  
  namespace ps2_stubs
  {
-@@ -37,6 +52,168 @@ namespace ps2_stubs
+@@ -37,6 +52,197 @@ namespace ps2_stubs
  #define EM_MIPS 8            // MIPS architecture
  #define PT_LOAD 1            // Loadable segment
  
@@ -35987,6 +36245,7 @@ index 45cb9d267..5c8b04867 100644
 +            {
 +                std::vector<int16_t> discard((queued - kTrimTo) * 2u);
 +                (void)ps2x::iop::readAudioFrames(discard.data(), queued - kTrimTo);
++                stats.discarded += queued - kTrimTo;
 +            }
 +#if defined(__EMSCRIPTEN__)
 +            // Browser: the ring buffer takes any amount, so only real samples go out (no zero
@@ -36008,7 +36267,35 @@ index 45cb9d267..5c8b04867 100644
 +                std::fill(buffer.begin() + static_cast<std::ptrdiff_t>(got * 2u), buffer.end(), int16_t{0});
 +                capture(buffer.data(), kFrames);
 +                UpdateAudioStream(stream, buffer.data(), static_cast<int>(kFrames));
++                stats.blocks++;
++                if (got < kFrames)
++                {
++                    stats.shortBlocks++;
++                    stats.padded += kFrames - got;
++                }
 +            }
++            report(queued);
++        }
++
++        // [audiostats] every 5 s: blocks sent to the device, how many were short (the rest is silence: a crackle) and by
++        // how much, what was thrown away to keep latency down, and the SPU2 queue's range.
++        struct Stats
++        {
++            uint64_t blocks = 0, shortBlocks = 0, padded = 0, discarded = 0;
++            size_t queueMin = SIZE_MAX, queueMax = 0;
++            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        } stats;
++        void report(size_t queued)
++        {
++            stats.queueMin = std::min(stats.queueMin, queued);
++            stats.queueMax = std::max(stats.queueMax, queued);
++            const auto now = std::chrono::steady_clock::now();
++            if (now - stats.t0 < std::chrono::seconds(5))
++                return;
++            std::fprintf(stderr, "[audio] 5 s: %llu blocks, %llu short (%.1f ms of silence added), %.1f ms discarded, queue %zu..%zu frames\n",
++                         static_cast<unsigned long long>(stats.blocks), static_cast<unsigned long long>(stats.shortBlocks),
++                         stats.padded / 48.0, stats.discarded / 48.0, stats.queueMin == SIZE_MAX ? 0 : stats.queueMin, stats.queueMax);
++            stats = Stats{};
 +        }
 +
 +        void stop()
@@ -36066,7 +36353,7 @@ index 45cb9d267..5c8b04867 100644
  static constexpr int FB_WIDTH = 640;
  static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-@@ -151,8 +328,18 @@ namespace
+@@ -151,8 +357,18 @@ namespace
          return true;
      }
  
@@ -36085,7 +36372,7 @@ index 45cb9d267..5c8b04867 100644
          DispatchHistory &h = g_dispatchHistory;
          h.pcs[h.next] = pc;
          h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
-@@ -162,6 +349,27 @@ namespace
+@@ -162,6 +378,27 @@ namespace
          }
      }
  
@@ -36113,7 +36400,7 @@ index 45cb9d267..5c8b04867 100644
      std::string formatDispatchHistory()
      {
          const DispatchHistory &h = g_dispatchHistory;
-@@ -477,10 +685,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -477,10 +714,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_hasUploadedFrame = true;
  }
  
@@ -36150,7 +36437,7 @@ index 45cb9d267..5c8b04867 100644
  
      m_eeScheduler = std::make_unique<EeScheduler>(*this);
  
-@@ -526,6 +760,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -526,6 +789,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
  
  PS2Runtime::~PS2Runtime()
  {
@@ -36158,7 +36445,7 @@ index 45cb9d267..5c8b04867 100644
      try
      {
          requestStop();
-@@ -605,9 +840,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+@@ -605,9 +869,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
      m_iopSubsystem->onSifTransfer(transfer);
  }
  
@@ -36177,7 +36464,7 @@ index 45cb9d267..5c8b04867 100644
  }
  
  void PS2Runtime::resetIop()
-@@ -715,6 +959,21 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -715,6 +988,21 @@ bool PS2Runtime::syncCoreSubsystems()
  
  bool PS2Runtime::initialize(const char *title)
  {
@@ -36199,7 +36486,7 @@ index 45cb9d267..5c8b04867 100644
      try
      {
          if (!m_memory.initialize())
-@@ -731,7 +990,10 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,7 +1019,10 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -36211,7 +36498,7 @@ index 45cb9d267..5c8b04867 100644
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
-@@ -1064,6 +1326,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+@@ -1064,6 +1355,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
          paths.cdRoot = paths.elfDirectory;
          paths.mcRoot = paths.elfDirectory / "mc0";
      }
@@ -36223,7 +36510,7 @@ index 45cb9d267..5c8b04867 100644
  
      setIoPaths(paths);
  }
-@@ -1342,6 +1609,402 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+@@ -1342,6 +1638,402 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
      }
  }
  
@@ -36626,7 +36913,7 @@ index 45cb9d267..5c8b04867 100644
  bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                       R5900Context *ctx,
                                       uint32_t targetPc,
-@@ -1352,6 +2015,88 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1352,6 +2044,88 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  {
      ctx->pc = targetPc;
      const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -36715,7 +37002,7 @@ index 45cb9d267..5c8b04867 100644
  
      // Every inter-function transfer is also a deterministic EE safe point.
      // Backward edges inside generated functions use eeCheckpointDue(), while
-@@ -1363,7 +2108,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1363,7 +2137,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      if (!isCall)
      {
@@ -36724,7 +37011,7 @@ index 45cb9d267..5c8b04867 100644
          {
              reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
          }
-@@ -1372,6 +2117,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1372,6 +2146,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -36739,7 +37026,7 @@ index 45cb9d267..5c8b04867 100644
      if (!hasFunction(targetPc))
      {
          reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
-@@ -1396,6 +2149,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +2178,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -36755,7 +37042,7 @@ index 45cb9d267..5c8b04867 100644
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,11 +2165,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,11 +2194,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -36782,7 +37069,7 @@ index 45cb9d267..5c8b04867 100644
      return ctx->pc == fallthroughPc;
  }
  
-@@ -1489,6 +2265,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+@@ -1489,6 +2294,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
      {
          ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
      }
@@ -36800,7 +37087,7 @@ index 45cb9d267..5c8b04867 100644
  }
  
  void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
-@@ -2339,6 +3126,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+@@ -2339,6 +3155,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
      raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
  }
  
@@ -36928,7 +37215,7 @@ index 45cb9d267..5c8b04867 100644
  void PS2Runtime::run()
  {
      m_stopRequested.store(false, std::memory_order_relaxed);
-@@ -2367,6 +3275,7 @@ void PS2Runtime::run()
+@@ -2367,6 +3304,7 @@ void PS2Runtime::run()
      std::thread gameThread([&]()
                             {
          ThreadNaming::SetCurrentThreadName("GameThread");
@@ -36936,7 +37223,7 @@ index 45cb9d267..5c8b04867 100644
          try
          {
              m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
-@@ -2385,6 +3294,9 @@ void PS2Runtime::run()
+@@ -2385,6 +3323,9 @@ void PS2Runtime::run()
          }
          gameThreadFinished.store(true, std::memory_order_release); });
  
@@ -36946,7 +37233,7 @@ index 45cb9d267..5c8b04867 100644
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
-@@ -2392,6 +3304,8 @@ void PS2Runtime::run()
+@@ -2392,6 +3333,8 @@ void PS2Runtime::run()
              tick++;
              if ((tick % 120) == 0)
              {
@@ -36955,7 +37242,7 @@ index 45cb9d267..5c8b04867 100644
                  uint64_t curDma = m_memory.dmaStartCount();
                  uint64_t curGif = m_memory.gifCopyCount();
                  uint64_t curGs = m_memory.gsWriteCount();
-@@ -2418,10 +3332,104 @@ void PS2Runtime::run()
+@@ -2418,11 +3361,104 @@ void PS2Runtime::run()
                                                 << " vif=" << curVif
                                                 << std::endl);
  
@@ -37053,14 +37340,15 @@ index 45cb9d267..5c8b04867 100644
 +        spu2Output.pump();
          uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-+#if defined(__EMSCRIPTEN__)
-+        // Browser: the page's GS host draws the picture; this headless window shows nothing.
+-        UploadFrame(frameTex, this, presentWidth, presentHeight);
++        // With the PCSX2 GS host drawing the game (and in the browser, the page's) this window is hidden: building and
++        // uploading a 640x512 picture from the runtime's VRAM every frame was most of this thread's time for nothing.
 +        if (!ps2_gsdump::liveActive())
-+#endif
-         UploadFrame(frameTex, this, presentWidth, presentHeight);
++            UploadFrame(frameTex, this, presentWidth, presentHeight);
  
          BeginDrawing();
-@@ -2459,6 +3467,7 @@ void PS2Runtime::run()
+         ClearBackground(BLACK);
+@@ -2459,6 +3495,7 @@ void PS2Runtime::run()
      {
          gameThread.join();
      }
